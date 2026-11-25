@@ -30,8 +30,14 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
-      - name: 配置 Android SDK
-        uses: android-actions/setup-android@v3
+      - name: 准备预装 Android SDK 许可
+        run: |
+          SDK_DIR="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_DIR" >> "$GITHUB_ENV"
+          if [ -x "$SDK_DIR/cmdline-tools/latest/bin/sdkmanager" ]; then
+            yes | "$SDK_DIR/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          fi
 
       - name: 安装前端依赖
         run: npm install
@@ -43,6 +49,8 @@ jobs:
         run: npm run build
 
       - name: 生成并同步 Capacitor Android 工程
+        env:
+          CI: 'true'
         run: |
           if [ ! -d "android" ]; then
             npx cap add android
