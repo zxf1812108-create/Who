@@ -88,9 +88,28 @@ function patchAndroidManifest() {
   }
 }
 
+function patchAndroidVersionCode() {
+  const rawCode = Number(process.env.ANDROID_VERSION_CODE);
+  if (!Number.isInteger(rawCode) || rawCode < 1) return;
+
+  const gradlePath = path.join(rootDir, 'android', 'app', 'build.gradle');
+  if (!fs.existsSync(gradlePath)) return;
+
+  let gradle = fs.readFileSync(gradlePath, 'utf8');
+  const updated = gradle
+    .replace(/versionCode\s+\d+/, `versionCode ${rawCode}`)
+    .replace(/versionName\s+"[^"]+"/, `versionName "1.0.${rawCode}"`);
+
+  if (updated !== gradle) {
+    fs.writeFileSync(gradlePath, updated, 'utf8');
+    console.log(`[prepare-android] Updated Android versionCode to ${rawCode} (1.0.${rawCode}).`);
+  }
+}
+
 if (mode === 'models' || mode === 'all') {
   ensureFaceModels();
 }
 if (mode === 'manifest' || mode === 'all') {
   patchAndroidManifest();
+  patchAndroidVersionCode();
 }
