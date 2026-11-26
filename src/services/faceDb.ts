@@ -173,7 +173,7 @@ export function parseFullBackupJson(rawText: string): ParsedBackupData {
             s &&
             typeof s.id === 'string' &&
             Array.isArray(s.descriptor) &&
-            s.descriptor.length === 128 &&
+            (s.descriptor.length === 512 || s.descriptor.length === 128) &&
             typeof s.thumbnail === 'string'
         )
         .map((s) => ({

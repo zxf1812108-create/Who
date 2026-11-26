@@ -7,14 +7,12 @@ import {
   CameraResultType,
   CameraSource,
 } from '@capacitor/camera';
-import * as faceapi from '@vladmandic/face-api';
 import type { EngineState, PersonRecord, RecognizedFace } from '../types/face';
 import {
-  distanceToSimilarity,
   loadImageElement,
+  matchDescriptorAgainstLibrary,
   readFileAsDataUrl,
   recognizeFacesInSource,
-  similarityToDistance,
 } from '../services/faceEngine';
 
 interface CameraRecognizeViewProps {
@@ -41,7 +39,6 @@ export const CameraRecognizeView: React.FC<CameraRecognizeViewProps> = ({
   const [capturedPhotoUrl, setCapturedPhotoUrl] = useState<string | null>(null);
   const [capturedFaces, setCapturedFaces] = useState<RecognizedFace[]>([]);
   const [selectedFaceId, setSelectedFaceId] = useState<string | null>(null);
-  const [elapsedMs, setElapsedMs] = useState<number | null>(null);
   const [hasAttemptedCapture, setHasAttemptedCapture] = useState(false);
   const [isCapturing, setIsCapturing] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -50,46 +47,15 @@ export const CameraRecognizeView: React.FC<CameraRecognizeViewProps> = ({
   const [registerName, setRegisterName] = useState('');
   const [registering, setRegistering] = useState(false);
 
-  const internalCutoff = useMemo(
-    () => similarityToDistance(minSimilarity),
-    [minSimilarity]
-  );
-
   // Re-evaluate captured faces immediately whenever library or similarity setting changes
   const evaluatedFaces = useMemo(() => {
     if (capturedFaces.length === 0) return [];
     return capturedFaces.map((face) => {
-      if (persons.length === 0) {
-        return { ...face, matchedPerson: null, topCandidates: [] };
-      }
-
-      const candidates = persons
-        .map((person) => {
-          let minDist = Number.POSITIVE_INFINITY;
-          let refThumb = person.samples[0]?.thumbnail || '';
-          for (const sample of person.samples) {
-            const d = faceapi.euclideanDistance(face.descriptor, sample.descriptor);
-            if (d < minDist) {
-              minDist = d;
-              refThumb = sample.thumbnail;
-            }
-          }
-          return {
-            personId: person.id,
-            personName: person.name,
-            personNote: person.note,
-            referenceThumbnail: refThumb,
-            distance: Number(minDist.toFixed(4)),
-            similarity: distanceToSimilarity(minDist),
-          };
-        })
-        .sort((a, b) => a.distance - b.distance);
-
-      const topCandidates = candidates.slice(0, 3);
-      const best = topCandidates[0];
-      const matchedPerson =
-        best && best.similarity >= minSimilarity ? best : null;
-
+      const { matchedPerson, topCandidates } = matchDescriptorAgainstLibrary(
+        face.descriptor,
+        persons,
+        minSimilarity
+      );
       return {
         ...face,
         matchedPerson,
@@ -115,11 +81,10 @@ export const CameraRecognizeView: React.FC<CameraRecognizeViewProps> = ({
       const result = await recognizeFacesInSource(
         img,
         persons,
-        internalCutoff,
+        minSimilarity,
         'accurate'
       );
       setCapturedFaces(result.faces);
-      setElapsedMs(result.elapsedMs);
       setSelectedFaceId(result.faces[0]?.id ?? null);
     } catch (err) {
       setAnalysisError(
@@ -366,11 +331,6 @@ export const CameraRecognizeView: React.FC<CameraRecognizeViewProps> = ({
             <span className="text-xs font-medium text-neutral-500 leading-none">
               抓拍人脸
             </span>
-            {elapsedMs !== null && activeFace && (
-              <span className="text-[11px] font-mono text-neutral-400 tabular-nums leading-none">
-                {elapsedMs} ms
-              </span>
-            )}
           </div>
 
           <div className="aspect-square w-full rounded-xl overflow-hidden bg-[#F4F4F2] border border-neutral-100 flex items-center justify-center">
@@ -403,7 +363,7 @@ export const CameraRecognizeView: React.FC<CameraRecognizeViewProps> = ({
         <div className="bg-white rounded-2xl border border-neutral-200/90 p-3 sm:p-4 flex flex-col gap-2.5">
           <div className="h-5 flex items-center justify-between gap-2">
             <span className="text-xs font-medium text-neutral-500 leading-none">
-              人物库匹配
+              人物匹配
             </span>
             {activeFace?.matchedPerson && (
               <span className="text-[11px] font-mono font-medium text-emerald-700 tabular-nums leading-none">

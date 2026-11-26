@@ -6,14 +6,28 @@ import type {
   RecognitionResult,
   RecognizedFace,
 } from '../types/face';
+import {
+  analyzeImageWithNativeInsightFace,
+  initializeNativeInsightFace,
+  isNativeInsightFacePlatform,
+} from './nativeFaceEngine';
 
 const MODEL_BASE_URL = '/models';
 
 let loadPromise: Promise<void> | null = null;
 let isLoaded = false;
+let activeBackend: 'insightface-r50' | 'face-api-web' = 'face-api-web';
 
 export function isEngineReady(): boolean {
   return isLoaded;
+}
+
+export function getActiveEngineBackend(): 'insightface-r50' | 'face-api-web' {
+  return activeBackend;
+}
+
+export function getActiveDescriptorDim(): 512 | 128 {
+  return activeBackend === 'insightface-r50' ? 512 : 128;
 }
 
 export async function initializeFaceEngine(
@@ -24,25 +38,35 @@ export async function initializeFaceEngine(
 
   loadPromise = (async () => {
     try {
+      if (isNativeInsightFacePlatform()) {
+        onProgress?.('正在初始化旗舰高精度识别引擎 (SCRFD + ArcFace R50)...');
+        await initializeNativeInsightFace();
+        activeBackend = 'insightface-r50';
+        isLoaded = true;
+        onProgress?.('旗舰本地人脸引擎已就绪');
+        return;
+      }
+
       onProgress?.('正在加载人脸检测网络 (SSD MobileNet)...');
       await faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_BASE_URL);
 
-      onProgress?.('正在加载实时取景检测器 (TinyFace)...');
+      onProgress?.('正在加载轻量检测器 (TinyFace)...');
       await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_BASE_URL);
 
-      onProgress?.('正在加载 68 点面部关键点模型...');
+      onProgress?.('正在加载面部关键点模型...');
       await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_BASE_URL);
 
-      onProgress?.('正在加载 128 维面部特征提取模型...');
+      onProgress?.('正在加载面部特征提取模型...');
       await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_BASE_URL);
 
+      activeBackend = 'face-api-web';
       isLoaded = true;
       onProgress?.('本地人脸特征引擎已就绪');
     } catch (error) {
       loadPromise = null;
       throw error instanceof Error
         ? error
-        : new Error('人脸识别模型加载失败，请刷新重试');
+        : new Error('人脸识别模型加载失败，请重启应用重试');
     }
   })();
 
@@ -75,20 +99,83 @@ export function parsePersonNameFromFilename(
 }
 
 /**
- * Converts 128D Euclidean distance to an intuitive similarity percentage (0 - 100).
- * FaceRecognitionNet typical same-person distance: 0.20 - 0.48; different-person: > 0.58.
+ * Computes cosine similarity between two equal-length embeddings.
+ */
+export function cosineSimilarity(
+  a: Float32Array | number[],
+  b: Float32Array | number[]
+): number {
+  const len = Math.min(a.length, b.length);
+  if (len === 0) return -1;
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < len; i++) {
+    const va = a[i];
+    const vb = b[i];
+    dot += va * vb;
+    normA += va * va;
+    normB += vb * vb;
+  }
+  const denom = Math.sqrt(normA) * Math.sqrt(normB);
+  if (denom <= 1e-8) return -1;
+  return dot / denom;
+}
+
+function computeNormalizedCentroid(vectors: number[][]): number[] {
+  const dim = vectors[0]?.length ?? 0;
+  const mean = new Array<number>(dim).fill(0);
+  for (const vec of vectors) {
+    for (let i = 0; i < dim; i++) {
+      mean[i] += vec[i];
+    }
+  }
+  let normSq = 0;
+  for (let i = 0; i < dim; i++) {
+    normSq += mean[i] * mean[i];
+  }
+  const norm = Math.sqrt(normSq);
+  if (norm > 1e-8) {
+    for (let i = 0; i < dim; i++) {
+      mean[i] /= norm;
+    }
+  }
+  return mean;
+}
+
+/**
+ * Calibrated cosine-to-percentage mapping for InsightFace ArcFace ResNet50 (w600k_r50).
+ * Different East Asian faces typically score 0.00 - 0.25; same person scores 0.38 - 0.78.
+ * Maps smoothly so:
+ *   cos 0.22 -> 40%
+ *   cos 0.30 -> 50% (宽松)
+ *   cos 0.38 -> 60% (标准)
+ *   cos 0.46 -> 70% (严格)
+ *   cos 0.58 -> 85%
+ *   cos >= 0.69 -> 99%
+ */
+export function cosineToSimilarity(cos: number): number {
+  if (cos >= 0.69) return 99;
+  if (cos <= 0.02) return 5;
+  if (cos < 0.22) {
+    return Math.max(5, Math.round(5 + ((cos - 0.02) / 0.2) * 35));
+  }
+  return Math.min(99, Math.round(40 + (cos - 0.22) * 125));
+}
+
+/**
+ * Converts 128D Euclidean distance (web fallback) to an intuitive similarity percentage (0 - 100).
  */
 export function distanceToSimilarity(distance: number): number {
   if (distance <= 0.15) return 99;
   if (distance >= 0.95) return 5;
-  // Smooth calibrated curve: 0.30 -> ~83%, 0.42 -> ~70%, 0.50 -> ~60%, 0.58 -> ~50%
   const normalized = Math.max(0, Math.min(1, 1 - Math.pow(distance / 0.88, 1.65)));
   return Math.round(normalized * 100);
 }
 
 /**
  * Converts a user-facing minimum similarity percentage (40 - 85) into
- * the corresponding internal 128D Euclidean distance cutoff.
+ * the corresponding 128D Euclidean distance cutoff (web fallback).
  */
 export function similarityToDistance(similarityPercent: number): number {
   const clamped = Math.max(10, Math.min(99, similarityPercent));
@@ -118,7 +205,6 @@ export function cropFaceThumbnail(
   const rawW = Math.min(sourceWidth - rawX, box.width + padX * 2);
   const rawH = Math.min(sourceHeight - rawY, box.height + padTop + padBottom);
 
-  // Make crop square while keeping face centered
   const side = Math.min(Math.max(rawW, rawH), Math.min(sourceWidth, sourceHeight));
   const centerX = rawX + rawW / 2;
   const centerY = rawY + rawH / 2;
@@ -164,7 +250,7 @@ export function createSnapshotDataUrl(
     ctx.drawImage(source, 0, 0, width, height);
   }
   return {
-    dataUrl: canvas.toDataURL('image/jpeg', 0.86),
+    dataUrl: canvas.toDataURL('image/jpeg', 0.88),
     width,
     height,
   };
@@ -194,7 +280,7 @@ export function readFileAsDataUrl(file: File): Promise<string> {
  */
 export function prepareCanvasFromImage(
   img: HTMLImageElement,
-  maxDim = 1024
+  maxDim = 1280
 ): HTMLCanvasElement {
   const naturalW = img.naturalWidth || img.width;
   const naturalH = img.naturalHeight || img.height;
@@ -221,12 +307,33 @@ export interface ExtractedFaceFeature {
 }
 
 /**
- * Extracts the primary (largest / highest-confidence) face feature vector from an imported photo.
+ * Extracts the primary (largest) face feature vector from an imported photo.
+ * Uses Android native InsightFace SCRFD + ArcFace R50 (512D + Flip-TTA) on APK,
+ * and falls back to face-api (128D) in desktop/web preview.
  */
 export async function extractPrimaryFaceFromImage(
   img: HTMLImageElement
 ): Promise<ExtractedFaceFeature | null> {
   await initializeFaceEngine();
+
+  if (activeBackend === 'insightface-r50') {
+    const canvas = prepareCanvasFromImage(img, 1280);
+    const inputDataUrl = canvas.toDataURL('image/jpeg', 0.93);
+    const originalPhoto = createSnapshotDataUrl(canvas, 820).dataUrl;
+    const response = await analyzeImageWithNativeInsightFace(inputDataUrl, true);
+    const primary = response.faces[0];
+    if (!primary || !primary.descriptor || primary.descriptor.length !== 512) {
+      return null;
+    }
+    return {
+      descriptor: primary.descriptor,
+      thumbnail: primary.thumbnail,
+      originalPhoto,
+      detectionScore: Number(primary.score.toFixed(3)),
+      box: primary.box,
+    };
+  }
+
   const canvas = prepareCanvasFromImage(img, 960);
 
   let detections = await faceapi
@@ -235,7 +342,6 @@ export async function extractPrimaryFaceFromImage(
     .withFaceDescriptors();
 
   if (detections.length === 0) {
-    // Fallback to TinyFaceDetector with lower threshold for small or low-light faces
     detections = await faceapi
       .detectAllFaces(
         canvas,
@@ -249,7 +355,6 @@ export async function extractPrimaryFaceFromImage(
     return null;
   }
 
-  // Pick the most prominent face (largest bounding box area)
   detections.sort(
     (a, b) =>
       b.detection.box.width * b.detection.box.height -
@@ -275,62 +380,177 @@ export async function extractPrimaryFaceFromImage(
   };
 }
 
-function matchDescriptorAgainstLibrary(
+/**
+ * Matches a face embedding against the person library.
+ * - For 512D InsightFace ArcFace embeddings: uses Cosine Similarity + Multi-Sample Centroid Fusion + Top1/Top2 margin protection.
+ * - For 128D web fallback embeddings: uses Euclidean Distance.
+ */
+export function matchDescriptorAgainstLibrary(
   descriptor: Float32Array | number[],
   persons: PersonRecord[],
-  threshold: number
+  minSimilarity: number
 ): { matchedPerson: CandidateMatch | null; topCandidates: CandidateMatch[] } {
-  if (persons.length === 0) {
+  if (persons.length === 0 || descriptor.length === 0) {
     return { matchedPerson: null, topCandidates: [] };
   }
 
+  const dim = descriptor.length;
+  const isArcFace512 = dim === 512;
   const candidates: CandidateMatch[] = [];
 
   for (const person of persons) {
-    let minDistance = Number.POSITIVE_INFINITY;
-    let bestThumbnail = person.samples[0]?.thumbnail || '';
+    const compatibleSamples = person.samples.filter(
+      (s) => Array.isArray(s.descriptor) && s.descriptor.length === dim
+    );
+    if (compatibleSamples.length === 0) continue;
 
-    for (const sample of person.samples) {
-      const dist = faceapi.euclideanDistance(descriptor, sample.descriptor);
-      if (dist < minDistance) {
-        minDistance = dist;
-        bestThumbnail = sample.thumbnail;
+    if (isArcFace512) {
+      let bestCos = -1;
+      let bestThumbnail = compatibleSamples[0].thumbnail || '';
+
+      for (const sample of compatibleSamples) {
+        const cos = cosineSimilarity(descriptor, sample.descriptor);
+        if (cos > bestCos) {
+          bestCos = cos;
+          bestThumbnail = sample.thumbnail;
+        }
       }
-    }
 
-    if (Number.isFinite(minDistance)) {
+      // Multi-sample centroid fusion boosts recall on intermediate angles/lighting
+      let effectiveCos = bestCos;
+      if (compatibleSamples.length >= 2) {
+        const centroid = computeNormalizedCentroid(
+          compatibleSamples.map((s) => s.descriptor)
+        );
+        const centroidCos = cosineSimilarity(descriptor, centroid);
+        if (centroidCos > effectiveCos) {
+          effectiveCos = centroidCos;
+        }
+      }
+
       candidates.push({
         personId: person.id,
         personName: person.name,
         personNote: person.note,
         referenceThumbnail: bestThumbnail,
-        distance: Number(minDistance.toFixed(4)),
-        similarity: distanceToSimilarity(minDistance),
+        distance: Number((1 - effectiveCos).toFixed(4)),
+        similarity: cosineToSimilarity(effectiveCos),
       });
+    } else {
+      let minDistance = Number.POSITIVE_INFINITY;
+      let bestThumbnail = compatibleSamples[0].thumbnail || '';
+
+      for (const sample of compatibleSamples) {
+        const dist = faceapi.euclideanDistance(descriptor, sample.descriptor);
+        if (dist < minDistance) {
+          minDistance = dist;
+          bestThumbnail = sample.thumbnail;
+        }
+      }
+
+      if (Number.isFinite(minDistance)) {
+        candidates.push({
+          personId: person.id,
+          personName: person.name,
+          personNote: person.note,
+          referenceThumbnail: bestThumbnail,
+          distance: Number(minDistance.toFixed(4)),
+          similarity: distanceToSimilarity(minDistance),
+        });
+      }
     }
   }
 
   candidates.sort((a, b) => a.distance - b.distance);
   const topCandidates = candidates.slice(0, 3);
   const best = topCandidates[0];
-  const matchedPerson = best && best.distance <= threshold ? best : null;
+  const second = topCandidates[1];
+
+  let matchedPerson: CandidateMatch | null = null;
+  if (best && best.similarity >= minSimilarity) {
+    // Top1 vs Top2 margin guard: prevent false labeling when borderline score is nearly tied
+    if (isArcFace512 && second) {
+      const cosGap = second.distance - best.distance;
+      const isBorderline = best.similarity < minSimilarity + 7;
+      if (isBorderline && cosGap < 0.035) {
+        matchedPerson = null;
+      } else {
+        matchedPerson = best;
+      }
+    } else {
+      matchedPerson = best;
+    }
+  }
 
   return { matchedPerson, topCandidates };
 }
 
 /**
- * Detects and identifies ALL faces in a captured photo or live camera frame.
+ * Detects and identifies ALL faces in a captured photo.
  */
 export async function recognizeFacesInSource(
   source: HTMLImageElement | HTMLVideoElement | HTMLCanvasElement,
   persons: PersonRecord[],
-  threshold = 0.52,
+  minSimilarity = 60,
   mode: 'accurate' | 'fast' = 'accurate'
 ): Promise<RecognitionResult> {
   await initializeFaceEngine();
   const start = performance.now();
 
-  let inputElement: HTMLCanvasElement | HTMLVideoElement =
+  if (activeBackend === 'insightface-r50') {
+    const canvas =
+      source instanceof HTMLImageElement
+        ? prepareCanvasFromImage(source, 1600)
+        : source instanceof HTMLCanvasElement
+          ? source
+          : (() => {
+              const c = document.createElement('canvas');
+              c.width = source.videoWidth;
+              c.height = source.videoHeight;
+              c.getContext('2d')?.drawImage(source, 0, 0);
+              return c;
+            })();
+
+    if (canvas.width === 0 || canvas.height === 0) {
+      return {
+        faces: [],
+        elapsedMs: Math.round(performance.now() - start),
+        imageWidth: 0,
+        imageHeight: 0,
+      };
+    }
+
+    const inputDataUrl = canvas.toDataURL('image/jpeg', 0.93);
+    const nativeRes = await analyzeImageWithNativeInsightFace(inputDataUrl, false);
+
+    // Sort left-to-right for natural reading order in group shots
+    const sortedNative = [...nativeRes.faces].sort((a, b) => a.box.x - b.box.x);
+    const faces: RecognizedFace[] = sortedNative.map((item, idx) => {
+      const { matchedPerson, topCandidates } = matchDescriptorAgainstLibrary(
+        item.descriptor,
+        persons,
+        minSimilarity
+      );
+      return {
+        id: `face-${Date.now()}-${idx}`,
+        box: item.box,
+        cropThumbnail: item.thumbnail,
+        descriptor: item.descriptor,
+        detectionScore: Number(item.score.toFixed(3)),
+        matchedPerson,
+        topCandidates,
+      };
+    });
+
+    return {
+      faces,
+      elapsedMs: Math.max(1, nativeRes.elapsedMs || Math.round(performance.now() - start)),
+      imageWidth: nativeRes.imageWidth || canvas.width,
+      imageHeight: nativeRes.imageHeight || canvas.height,
+    };
+  }
+
+  const inputElement: HTMLCanvasElement | HTMLVideoElement =
     source instanceof HTMLImageElement
       ? prepareCanvasFromImage(source, 1440)
       : source;
@@ -373,7 +593,6 @@ export async function recognizeFacesInSource(
       .withFaceDescriptors();
   }
 
-  // Sort left-to-right for natural reading order in group shots
   detections.sort((a, b) => a.detection.box.x - b.detection.box.x);
 
   const faces: RecognizedFace[] = detections.map((det, idx) => {
@@ -381,7 +600,7 @@ export async function recognizeFacesInSource(
     const { matchedPerson, topCandidates } = matchDescriptorAgainstLibrary(
       det.descriptor,
       persons,
-      threshold
+      minSimilarity
     );
 
     const cropThumbnail =

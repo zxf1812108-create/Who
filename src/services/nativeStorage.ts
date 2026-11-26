@@ -14,19 +14,36 @@ interface StoragePickerPlugin {
   readDocumentImage(options: { uri: string }): Promise<{
     dataUrl: string;
   }>;
-  exportBackupToFolder(options: {
-    filename: string;
-    content: string;
-  }): Promise<{
+  pickExportFolder(): Promise<{
     cancelled: boolean;
-    filename?: string;
+    treeUri?: string;
     folderName?: string;
+  }>;
+  beginBackupWrite(options: {
+    treeUri: string;
+    filename: string;
+  }): Promise<{
+    started: boolean;
+    filename?: string;
+  }>;
+  appendBackupChunk(options: { chunk: string }): Promise<{ ok: boolean }>;
+  finishBackupWrite(): Promise<{
+    filename?: string;
+    bytesWritten: number;
   }>;
   pickBackupFile(): Promise<{
     cancelled: boolean;
     filename?: string;
-    content?: string;
+    totalChars?: number;
   }>;
+  readBackupChunk(options: {
+    offset: number;
+    length: number;
+  }): Promise<{
+    chunk: string;
+    done: boolean;
+  }>;
+  clearBackupReadCache(): Promise<void>;
 }
 
 const StoragePicker = registerPlugin<StoragePickerPlugin>('StoragePicker');
@@ -165,17 +182,31 @@ export async function exportBackupToChosenFolder(
   ok: boolean;
   message: string;
 }> {
-  // 1. Native Android APK: ACTION_OPEN_DOCUMENT_TREE folder picker + direct write
+  // 1. Native Android APK: Two-step SAF folder pick + chunked streaming write
+  //    (avoids Android 1MB Binder TransactionTooLargeException on large photo backups)
   if (Capacitor.isNativePlatform()) {
-    const res = await StoragePicker.exportBackupToFolder({ filename, content });
-    if (res.cancelled) {
+    const picked = await StoragePicker.pickExportFolder();
+    if (picked.cancelled || !picked.treeUri) {
       return { cancelled: true, ok: false, message: '' };
     }
-    const targetFolder = res.folderName ? `「${res.folderName}」文件夹中的 ` : '';
+
+    const CHUNK_CHARS = 180_000;
+    await StoragePicker.beginBackupWrite({
+      treeUri: picked.treeUri,
+      filename,
+    });
+
+    for (let offset = 0; offset < content.length; offset += CHUNK_CHARS) {
+      const chunk = content.slice(offset, offset + CHUNK_CHARS);
+      await StoragePicker.appendBackupChunk({ chunk });
+    }
+
+    const finished = await StoragePicker.finishBackupWrite();
+    const targetFolder = picked.folderName ? `「${picked.folderName}」文件夹中的 ` : '';
     return {
       cancelled: false,
       ok: true,
-      message: `已将全部照片、特征数据与设置导出至 ${targetFolder}${res.filename || filename}`,
+      message: `已将全部照片、特征数据与设置导出至 ${targetFolder}${finished.filename || filename}`,
     };
   }
 
@@ -228,17 +259,38 @@ export async function pickBackupFileNativeOrWeb(
   filename?: string;
   content?: string;
 }> {
-  // 1. Native Android APK: ACTION_OPEN_DOCUMENT folder/file browser
+  // 1. Native Android APK: ACTION_OPEN_DOCUMENT + chunked read from native cache
+  //    (avoids Android WebView evaluateJavascript payload truncation on multi-MB backups)
   if (Capacitor.isNativePlatform()) {
     const res = await StoragePicker.pickBackupFile();
-    if (res.cancelled || !res.content) {
+    if (res.cancelled || !res.totalChars || res.totalChars <= 0) {
       return { handled: true, cancelled: true };
     }
+
+    const CHUNK_CHARS = 180_000;
+    const parts: string[] = [];
+    try {
+      for (let offset = 0; offset < res.totalChars; offset += CHUNK_CHARS) {
+        const piece = await StoragePicker.readBackupChunk({
+          offset,
+          length: CHUNK_CHARS,
+        });
+        parts.push(piece.chunk);
+        if (piece.done) break;
+      }
+    } finally {
+      try {
+        await StoragePicker.clearBackupReadCache();
+      } catch {
+        // Ignore cache cleanup errors
+      }
+    }
+
     return {
       handled: true,
       cancelled: false,
       filename: res.filename,
-      content: res.content,
+      content: parts.join(''),
     };
   }
 

@@ -67,6 +67,30 @@ jobs:
           fi
           npx cap sync android
 
+      - name: 缓存 InsightFace 旗舰识别模型 (SCRFD + ArcFace R50)
+        id: cache-insightface
+        uses: actions/cache@v4
+        with:
+          path: .insightface-cache
+          key: insightface-buffalo-l-r50-v1
+
+      - name: 下载并内置 InsightFace 旗舰 ONNX 模型
+        run: |
+          mkdir -p .insightface-cache android/app/src/main/assets/insightface
+          if [ ! -s ".insightface-cache/det_10g.onnx" ] || [ ! -s ".insightface-cache/w600k_r50.onnx" ]; then
+            echo "Downloading InsightFace buffalo_l model pack..."
+            curl -fL --retry 3 --retry-delay 5 \
+              -o /tmp/buffalo_l.zip \
+              "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip"
+            unzip -o -j /tmp/buffalo_l.zip "*det_10g.onnx" "*w600k_r50.onnx" -d .insightface-cache
+            rm -f /tmp/buffalo_l.zip
+          fi
+          cp .insightface-cache/det_10g.onnx android/app/src/main/assets/insightface/det_10g.onnx
+          cp .insightface-cache/w600k_r50.onnx android/app/src/main/assets/insightface/w600k_r50.onnx
+          ls -lh android/app/src/main/assets/insightface/
+          test -s android/app/src/main/assets/insightface/det_10g.onnx
+          test -s android/app/src/main/assets/insightface/w600k_r50.onnx
+
       - name: 计算版本号并注入权限与原生插件
         env:
           GITHUB_TOKEN: ${{ github.token }}

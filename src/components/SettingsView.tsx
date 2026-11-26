@@ -34,12 +34,6 @@ interface SettingsViewProps {
   onImportBackupContent: (rawJson: string) => Promise<{ ok: boolean; message: string }>;
 }
 
-const SIMILARITY_PRESETS = [
-  { label: '宽松', value: 50, desc: '更容易认出' },
-  { label: '标准', value: 60, desc: '推荐设置' },
-  { label: '严格', value: 70, desc: '防认错优先' },
-] as const;
-
 export const SettingsView: React.FC<SettingsViewProps> = ({
   engineState,
   personCount,
@@ -60,11 +54,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const folderInputRef = useRef<HTMLInputElement>(null);
   const backupInputRef = useRef<HTMLInputElement>(null);
 
-  const [backupBusy, setBackupBusy] = useState(false);
+  const [backupBusy, setBackupBusy] = useState<'export' | 'restore' | null>(null);
   const [backupNotice, setBackupNotice] = useState<{
     type: 'ok' | 'err';
     text: string;
   } | null>(null);
+  const noticeTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     const input = folderInputRef.current;
@@ -72,11 +67,22 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       input.setAttribute('webkitdirectory', '');
       input.setAttribute('directory', '');
     }
+    return () => {
+      if (noticeTimerRef.current !== null) {
+        window.clearTimeout(noticeTimerRef.current);
+      }
+    };
   }, []);
 
   const showNotice = (type: 'ok' | 'err', text: string) => {
+    if (noticeTimerRef.current !== null) {
+      window.clearTimeout(noticeTimerRef.current);
+    }
     setBackupNotice({ type, text });
-    window.setTimeout(() => setBackupNotice(null), 4500);
+    noticeTimerRef.current = window.setTimeout(() => {
+      setBackupNotice(null);
+      noticeTimerRef.current = null;
+    }, 8000);
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -112,7 +118,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   const handleExportClick = async () => {
     if (backupBusy) return;
-    setBackupBusy(true);
+    setBackupBusy('export');
+    setBackupNotice(null);
     try {
       const res = await onExportBackup();
       if (!res.cancelled) {
@@ -124,13 +131,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         err instanceof Error ? err.message : '导出备份失败，请重试'
       );
     } finally {
-      setBackupBusy(false);
+      setBackupBusy(null);
     }
   };
 
   const handleRestoreClick = async () => {
     if (backupBusy) return;
-    setBackupBusy(true);
+    setBackupBusy('restore');
+    setBackupNotice(null);
     try {
       const picked = await pickBackupFileNativeOrWeb(() => {
         backupInputRef.current?.click();
@@ -146,7 +154,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         err instanceof Error ? err.message : '读取备份文件失败'
       );
     } finally {
-      setBackupBusy(false);
+      setBackupBusy(null);
     }
   };
 
@@ -156,7 +164,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     const file = e.target.files?.[0];
     e.target.value = '';
     if (!file) return;
-    setBackupBusy(true);
+    setBackupBusy('restore');
     try {
       const content = await file.text();
       const res = await onImportBackupContent(content);
@@ -167,7 +175,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         err instanceof Error ? err.message : '读取备份文件失败'
       );
     } finally {
-      setBackupBusy(false);
+      setBackupBusy(null);
     }
   };
 
@@ -349,21 +357,29 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         <div className="pt-3 border-t border-neutral-100 flex items-center justify-around gap-4 text-xs">
           <button
             type="button"
-            disabled={backupBusy}
+            disabled={backupBusy !== null}
             onClick={() => void handleExportClick()}
             className="min-h-[40px] px-3 text-neutral-700 hover:text-neutral-950 inline-flex items-center gap-1.5 disabled:opacity-40 whitespace-nowrap"
           >
-            <Download className="w-3.5 h-3.5" />
-            <span>导出备份</span>
+            {backupBusy === 'export' ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <Download className="w-3.5 h-3.5" />
+            )}
+            <span>{backupBusy === 'export' ? '正在导出...' : '导出备份'}</span>
           </button>
           <button
             type="button"
-            disabled={backupBusy}
+            disabled={backupBusy !== null}
             onClick={() => void handleRestoreClick()}
             className="min-h-[40px] px-3 text-neutral-700 hover:text-neutral-950 inline-flex items-center gap-1.5 disabled:opacity-40 whitespace-nowrap"
           >
-            <Upload className="w-3.5 h-3.5" />
-            <span>恢复备份</span>
+            {backupBusy === 'restore' ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <Upload className="w-3.5 h-3.5" />
+            )}
+            <span>{backupBusy === 'restore' ? '正在恢复...' : '恢复备份'}</span>
           </button>
           <input
             ref={backupInputRef}
@@ -387,53 +403,22 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         )}
       </section>
 
-      {/* LOWER SECTION: Simplified Similarity Matching Requirement */}
+      {/* LOWER SECTION: Minimalist Similarity Slider */}
       <section
         aria-label="匹配相似度设置"
         className="bg-white rounded-2xl border border-neutral-200/90 p-5 space-y-4"
       >
         <div className="space-y-1.5">
-          <div className="flex items-baseline justify-between gap-2">
-            <h2 className="text-base font-semibold text-neutral-950">
-              匹配相似度
-            </h2>
-            <span className="text-base font-semibold font-mono text-neutral-950 tabular-nums shrink-0">
-              ≥ {minSimilarity}%
-            </span>
-          </div>
+          <h2 className="text-base font-semibold text-neutral-950">
+            匹配相似度
+          </h2>
           <p className="text-xs text-neutral-500 leading-relaxed">
             数值越小，匹配越宽松，越容易认出，但也容易认错；数值越大，匹配越严格，越不容易认出，但也不容易认错。
           </p>
         </div>
 
-        {/* 3 Preset Tiers */}
-        <div className="grid grid-cols-3 gap-1.5 p-1 bg-[#F4F4F2] rounded-xl">
-          {SIMILARITY_PRESETS.map((preset) => {
-            const active = minSimilarity === preset.value;
-            return (
-              <button
-                key={preset.label}
-                type="button"
-                onClick={() => onChangeMinSimilarity(preset.value)}
-                className={`min-h-[46px] px-2 py-1.5 rounded-lg text-xs font-medium transition-colors flex flex-col items-center justify-center ${
-                  active
-                    ? 'bg-white text-neutral-950 shadow-xs'
-                    : 'text-neutral-500 hover:text-neutral-900'
-                }`}
-              >
-                <span>
-                  {preset.label} {preset.value}%
-                </span>
-                <span className="text-[10px] text-neutral-400 font-normal mt-0.5">
-                  {preset.desc}
-                </span>
-              </button>
-            );
-          })}
-        </div>
-
-        {/* Precision Slider + +/- 1% Stepper */}
-        <div className="pt-1">
+        {/* Precision Slider + +/- 1% Stepper with Centered Value Beneath */}
+        <div className="pt-1 space-y-2">
           <div className="flex items-center gap-2.5">
             <button
               type="button"
@@ -456,11 +441,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 onChange={(e) => onChangeMinSimilarity(Number(e.target.value))}
                 className="w-full h-2 accent-neutral-950 cursor-pointer"
               />
-              <div className="flex items-center justify-between text-[11px] text-neutral-400 font-mono tabular-nums mt-1.5">
-                <span>40% 宽松</span>
-                <span>60% 标准</span>
-                <span>85% 严格</span>
-              </div>
             </div>
 
             <button
@@ -472,6 +452,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             >
               <Plus className="w-4 h-4" />
             </button>
+          </div>
+
+          <div className="text-center text-base font-semibold font-mono text-neutral-950 tabular-nums">
+            {minSimilarity}%
           </div>
         </div>
       </section>

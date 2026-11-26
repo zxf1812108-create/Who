@@ -15,6 +15,7 @@ import type {
 } from './types/face';
 import {
   extractPrimaryFaceFromImage,
+  getActiveDescriptorDim,
   initializeFaceEngine,
   loadImageElement,
   parsePersonNameFromFilename,
@@ -80,6 +81,7 @@ export default function App() {
 
   const [importQueue, setImportQueue] = useState<ImportQueueItem[]>([]);
   const [isImporting, setIsImporting] = useState(false);
+  const [migrationText, setMigrationText] = useState<string | null>(null);
 
   const handleChangeMinSimilarity = useCallback((value: number) => {
     const clamped = Math.max(40, Math.min(85, Math.round(value)));
@@ -100,6 +102,67 @@ export default function App() {
     }
   }, []);
 
+  const upgradeLegacySamplesIfNeeded = useCallback(async () => {
+    const targetDim = getActiveDescriptorDim();
+    if (targetDim !== 512) return;
+
+    const currentPersons = await getAllPersons();
+    let totalLegacy = 0;
+    for (const person of currentPersons) {
+      for (const sample of person.samples) {
+        if (sample.descriptor.length !== 512) {
+          totalLegacy += 1;
+        }
+      }
+    }
+    if (totalLegacy === 0) return;
+
+    let done = 0;
+    const upgradedPersons: PersonRecord[] = [];
+    for (const person of currentPersons) {
+      let personChanged = false;
+      const nextSamples: FaceSample[] = [];
+      for (const sample of person.samples) {
+        if (sample.descriptor.length === 512) {
+          nextSamples.push(sample);
+          continue;
+        }
+        done += 1;
+        setMigrationText(`正在用旗舰高精度模型升级已有照片特征 (${done}/${totalLegacy})...`);
+        const photoSrc = sample.originalPhoto || sample.thumbnail;
+        if (photoSrc) {
+          try {
+            const img = await loadImageElement(photoSrc);
+            const extracted = await extractPrimaryFaceFromImage(img);
+            if (extracted && extracted.descriptor.length === 512) {
+              nextSamples.push({
+                ...sample,
+                descriptor: extracted.descriptor,
+                thumbnail: extracted.thumbnail || sample.thumbnail,
+                detectionScore: extracted.detectionScore,
+              });
+              personChanged = true;
+              continue;
+            }
+          } catch {
+            // Keep original sample if re-extraction fails on an unreadable crop
+          }
+        }
+        nextSamples.push(sample);
+      }
+      const nextPerson = personChanged
+        ? { ...person, samples: nextSamples, updatedAt: Date.now() }
+        : person;
+      if (personChanged) {
+        await putPerson(nextPerson);
+      }
+      upgradedPersons.push(nextPerson);
+    }
+
+    setPersons(sortPersonsList(upgradedPersons));
+    setMigrationText(null);
+  }, []);
+
   const bootEngine = useCallback(async () => {
     setEngineState({
       status: 'loading',
@@ -113,6 +176,7 @@ export default function App() {
         status: 'ready',
         progressText: '模型已就绪',
       });
+      await upgradeLegacySamplesIfNeeded();
     } catch (err) {
       setEngineState({
         status: 'error',
@@ -121,7 +185,7 @@ export default function App() {
           err instanceof Error ? err.message : '无法加载人脸识别权重文件',
       });
     }
-  }, []);
+  }, [upgradeLegacySamplesIfNeeded]);
 
   useEffect(() => {
     void (async () => {
@@ -483,11 +547,12 @@ export default function App() {
       try {
         const parsed = parseFullBackupJson(rawJson);
 
-        // Restore full person database (photos, 128D features, custom sort order)
+        // Restore full person database (photos, features, custom sort order)
         if (parsed.persons.length > 0) {
           await replaceAllPersons(parsed.persons);
           const refreshed = await getAllPersons();
           setPersons(refreshed);
+          await upgradeLegacySamplesIfNeeded();
         }
 
         // Restore all saved application settings
@@ -515,7 +580,11 @@ export default function App() {
         };
       }
     },
-    [handleChangeMinSimilarity, handleToggleMergeSuffixes]
+    [
+      handleChangeMinSimilarity,
+      handleToggleMergeSuffixes,
+      upgradeLegacySamplesIfNeeded,
+    ]
   );
 
   return (
@@ -550,10 +619,19 @@ export default function App() {
         </div>
       )}
 
+      {migrationText && engineState.status === 'ready' && (
+        <div className="max-w-4xl w-full mx-auto px-4 pt-safe">
+          <div className="bg-white border border-neutral-200/90 rounded-xl px-3.5 py-2.5 flex items-center gap-2.5 text-xs text-neutral-700">
+            <Loader2 className="w-3.5 h-3.5 text-neutral-900 animate-spin shrink-0" />
+            <span className="truncate">{migrationText}</span>
+          </div>
+        </div>
+      )}
+
       {/* Main Content Above Bottom Minimalist Toolbar */}
       <main
         className={`flex-1 max-w-4xl w-full mx-auto px-4 sm:px-6 pb-24 ${
-          engineState.status === 'ready' ? 'pt-safe' : 'pt-3'
+          engineState.status === 'ready' && !migrationText ? 'pt-safe' : 'pt-3'
         }`}
       >
         {activeTab === 'camera' && (

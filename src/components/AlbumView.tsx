@@ -3,6 +3,7 @@ import {
   Check,
   ImagePlus,
   Loader2,
+  Pencil,
   RotateCcw,
   Search,
   Trash2,
@@ -39,6 +40,7 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
 }) => {
   const [query, setQuery] = useState('');
   const [selectedPersonId, setSelectedPersonId] = useState<string | null>(null);
+  const [isEditing, setIsEditing] = useState(false);
   const [editName, setEditName] = useState('');
   const [editNote, setEditNote] = useState('');
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
@@ -69,6 +71,7 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
   personsRef.current = persons;
 
   const addSampleInputRef = useRef<HTMLInputElement>(null);
+  const nameInputRef = useRef<HTMLInputElement>(null);
 
   const isSearching = query.trim().length > 0;
 
@@ -98,6 +101,7 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
 
   const openPersonSheet = (person: PersonRecord) => {
     setSelectedPersonId(person.id);
+    setIsEditing(false);
     setEditName(person.name);
     setEditNote(person.note);
     setConfirmDeleteId(null);
@@ -106,6 +110,7 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
 
   const closePersonSheet = () => {
     setSelectedPersonId(null);
+    setIsEditing(false);
     setConfirmDeleteId(null);
     setDetailNotice(null);
   };
@@ -257,8 +262,8 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
     }
   };
 
-  const handleSaveEdit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleSaveEdit = async (e?: React.FormEvent) => {
+    e?.preventDefault();
     if (!selectedPerson) return;
     const trimmed = editName.trim();
     if (!trimmed) {
@@ -266,7 +271,21 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
       return;
     }
     await onUpdatePerson(selectedPerson.id, trimmed, editNote.trim());
-    setDetailNotice({ type: 'ok', text: '档案信息已更新' });
+    setIsEditing(false);
+    setDetailNotice({ type: 'ok', text: '档案信息已保存' });
+  };
+
+  const handleToggleEditOrSave = async () => {
+    if (!selectedPerson) return;
+    if (!isEditing) {
+      setIsEditing(true);
+      setDetailNotice(null);
+      window.setTimeout(() => {
+        nameInputRef.current?.focus();
+      }, 40);
+      return;
+    }
+    await handleSaveEdit();
   };
 
   const handleAddSampleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -318,7 +337,7 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
             <span>
               {isSearching
                 ? `匹配 ${displayedPersons.length} 人`
-                : `共 ${persons.length} 位人物`}
+                : `共 ${persons.length} 人`}
             </span>
             {!isSearching && persons.length > 0 && (
               <>
@@ -447,8 +466,31 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
               <div className="w-9 h-1 rounded-full bg-neutral-300" />
             </div>
 
-            {/* Compact Title Bar: Left = Delete, Center = Name, Right = Close */}
-            <div className="px-4 py-3 border-b border-neutral-100 grid grid-cols-[auto_1fr_auto] items-center gap-2">
+            {/* Compact Title Bar: Left = Edit/Save, Center = Delete, Right = Close */}
+            <div className="px-4 py-3 border-b border-neutral-100 grid grid-cols-3 items-center gap-2">
+              <button
+                type="button"
+                onClick={() => void handleToggleEditOrSave()}
+                aria-label={isEditing ? '保存修改' : '编辑信息'}
+                className={`justify-self-start min-h-[40px] px-3 rounded-xl text-xs font-medium inline-flex items-center gap-1 transition-colors ${
+                  isEditing
+                    ? 'bg-neutral-900 text-white hover:bg-neutral-800'
+                    : 'text-neutral-800 hover:bg-neutral-100'
+                }`}
+              >
+                {isEditing ? (
+                  <>
+                    <Check className="w-3.5 h-3.5" />
+                    <span>保存</span>
+                  </>
+                ) : (
+                  <>
+                    <Pencil className="w-3.5 h-3.5" />
+                    <span>编辑</span>
+                  </>
+                )}
+              </button>
+
               <button
                 type="button"
                 onClick={() =>
@@ -457,21 +499,17 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
                   )
                 }
                 aria-label="删除该人物"
-                className="min-h-[40px] px-2.5 rounded-xl text-red-600 hover:bg-red-50 text-xs font-medium inline-flex items-center gap-1 transition-colors"
+                className="justify-self-center min-h-[40px] px-3 rounded-xl text-red-600 hover:bg-red-50 text-xs font-medium inline-flex items-center gap-1 transition-colors"
               >
                 <Trash2 className="w-3.5 h-3.5" />
                 <span>删除</span>
               </button>
 
-              <h2 className="text-base font-semibold text-neutral-950 text-center truncate px-1">
-                {selectedPerson.name}
-              </h2>
-
               <button
                 type="button"
                 onClick={closePersonSheet}
                 aria-label="关闭"
-                className="min-h-[40px] min-w-[40px] flex items-center justify-center rounded-xl text-neutral-500 hover:bg-neutral-100 transition-colors"
+                className="justify-self-end min-h-[40px] min-w-[40px] flex items-center justify-center rounded-xl text-neutral-500 hover:bg-neutral-100 transition-colors"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -524,10 +562,16 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
                       姓名
                     </label>
                     <input
+                      ref={nameInputRef}
                       type="text"
                       value={editName}
+                      readOnly={!isEditing}
                       onChange={(e) => setEditName(e.target.value)}
-                      className="w-full min-h-[42px] px-3 rounded-xl border border-neutral-200 text-sm text-neutral-900 focus:outline-none focus:border-neutral-900"
+                      className={`w-full min-h-[42px] px-3 rounded-xl border text-sm transition-colors focus:outline-none ${
+                        isEditing
+                          ? 'bg-white border-neutral-300 text-neutral-950 focus:border-neutral-900'
+                          : 'bg-[#F8F8F7] border-neutral-200/80 text-neutral-800'
+                      }`}
                     />
                   </div>
                   <div>
@@ -537,19 +581,17 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
                     <input
                       type="text"
                       value={editNote}
+                      readOnly={!isEditing}
                       onChange={(e) => setEditNote(e.target.value)}
-                      placeholder="分组或备注信息"
-                      className="w-full min-h-[42px] px-3 rounded-xl border border-neutral-200 text-sm text-neutral-900 focus:outline-none focus:border-neutral-900"
+                      placeholder={isEditing ? '分组或备注信息' : '暂无备注'}
+                      className={`w-full min-h-[42px] px-3 rounded-xl border text-sm transition-colors focus:outline-none ${
+                        isEditing
+                          ? 'bg-white border-neutral-300 text-neutral-950 focus:border-neutral-900'
+                          : 'bg-[#F8F8F7] border-neutral-200/80 text-neutral-800 placeholder:text-neutral-400'
+                      }`}
                     />
                   </div>
                 </div>
-                <button
-                  type="submit"
-                  className="min-h-[40px] px-4 py-2 rounded-xl bg-neutral-900 text-white text-xs font-medium hover:bg-neutral-800 inline-flex items-center gap-1.5"
-                >
-                  <Check className="w-3.5 h-3.5" />
-                  <span>保存修改</span>
-                </button>
               </form>
 
               <div className="space-y-3 pt-4 border-t border-neutral-100">

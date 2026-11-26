@@ -80,16 +80,25 @@ function patchAndroidManifest() {
     .filter((entry) => !xml.includes(entry.check))
     .map((entry) => entry.line);
 
+  let changed = false;
   if (toInsert.length > 0) {
     xml = xml.replace('<application', `${toInsert.join('\n')}\n\n    <application`);
+    changed = true;
+  }
+  if (!xml.includes('android:largeHeap=')) {
+    xml = xml.replace('<application', '<application\n        android:largeHeap="true"');
+    changed = true;
+  }
+
+  if (changed) {
     fs.writeFileSync(manifestPath, xml, 'utf8');
-    console.log(`[prepare-android] Added ${toInsert.length} permission/feature entries to AndroidManifest.xml.`);
+    console.log(`[prepare-android] Patched AndroidManifest.xml (permissions & largeHeap).`);
   } else {
-    console.log('[prepare-android] AndroidManifest.xml already contains camera and photo permissions.');
+    console.log('[prepare-android] AndroidManifest.xml already patched.');
   }
 }
 
-function patchAndroidVersionCode() {
+function patchAndroidBuildGradle() {
   const gradlePath = path.join(rootDir, 'android', 'app', 'build.gradle');
   if (!fs.existsSync(gradlePath)) return;
 
@@ -101,8 +110,7 @@ function patchAndroidVersionCode() {
   );
   const major = Math.max(1, currentYear - 2025);
   const envMinor = Number(process.env.ANDROID_VERSION_MINOR);
-  const minor =
-    Number.isInteger(envMinor) && envMinor >= 1 ? envMinor : 1;
+  const minor = Number.isInteger(envMinor) && envMinor >= 1 ? envMinor : 1;
 
   const versionName =
     (process.env.ANDROID_VERSION_NAME || '').trim() || `${major}.${minor}`;
@@ -114,14 +122,30 @@ function patchAndroidVersionCode() {
       : major * 100000 + minor;
 
   let gradle = fs.readFileSync(gradlePath, 'utf8');
-  const updated = gradle
+  let updated = gradle
     .replace(/versionCode\s+\d+/, `versionCode ${versionCode}`)
     .replace(/versionName\s+"[^"]+"/, `versionName "${versionName}"`);
+
+  // Keep .onnx model weights uncompressed inside APK for fast native loading & zero deflate RAM overhead
+  if (!updated.includes('noCompress')) {
+    updated = updated.replace(
+      '    buildTypes {',
+      '    androidResources {\n        noCompress += ["onnx"]\n    }\n    buildTypes {'
+    );
+  }
+
+  // Add Microsoft ONNX Runtime Android native dependency for InsightFace SCRFD + ArcFace ResNet50
+  if (!updated.includes('com.microsoft.onnxruntime:onnxruntime-android')) {
+    updated = updated.replace(
+      "    implementation project(':capacitor-android')",
+      "    implementation project(':capacitor-android')\n    implementation 'com.microsoft.onnxruntime:onnxruntime-android:latest.release'"
+    );
+  }
 
   if (updated !== gradle) {
     fs.writeFileSync(gradlePath, updated, 'utf8');
     console.log(
-      `[prepare-android] Updated Android version to ${versionName} (versionCode ${versionCode}).`
+      `[prepare-android] Patched build.gradle: v${versionName} (versionCode ${versionCode}), onnxruntime-android, and noCompress onnx.`
     );
   }
 }
@@ -161,6 +185,7 @@ public class MainActivity extends BridgeActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         registerPlugin(StoragePickerPlugin.class);
+        registerPlugin(NativeFaceEnginePlugin.class);
         super.onCreate(savedInstanceState);
 
         WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
@@ -181,10 +206,9 @@ public class MainActivity extends BridgeActivity {
                 Insets bars = windowInsets.getInsets(
                     WindowInsetsCompat.Type.systemBars()
                         | WindowInsetsCompat.Type.displayCutout()
-                        | WindowInsetsCompat.Type.ime()
                 );
                 view.setPadding(bars.left, bars.top, bars.right, bars.bottom);
-                return WindowInsetsCompat.CONSUMED;
+                return windowInsets;
             });
             ViewCompat.requestApplyInsets(contentView);
         }
@@ -217,6 +241,7 @@ import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.ActivityCallback;
 import com.getcapacitor.annotation.CapacitorPlugin;
+import java.io.BufferedOutputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -226,8 +251,11 @@ import java.util.Locale;
 @CapacitorPlugin(name = "StoragePicker")
 public class StoragePickerPlugin extends Plugin {
 
-    private String pendingExportFilename = null;
-    private String pendingExportContent = null;
+    private final Object backupIoLock = new Object();
+    private OutputStream activeExportStream = null;
+    private String activeExportFilename = null;
+    private long activeExportBytes = 0L;
+    private String cachedRestoreContent = null;
 
     @PluginMethod
     public void pickFolderImages(PluginCall call) {
@@ -427,31 +455,18 @@ public class StoragePickerPlugin extends Plugin {
     }
 
     @PluginMethod
-    public void exportBackupToFolder(PluginCall call) {
-        String filename = call.getString("filename", "renlian-backup.json");
-        String content = call.getString("content");
-        if (content == null) {
-            call.reject("备份内容为空");
-            return;
-        }
-
-        pendingExportFilename = filename;
-        pendingExportContent = content;
-
+    public void pickExportFolder(PluginCall call) {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
         intent.addFlags(
-            Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            Intent.FLAG_GRANT_READ_URI_PERMISSION
+                | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION
         );
-        startActivityForResult(call, intent, "onExportBackupResult");
+        startActivityForResult(call, intent, "onPickExportFolderResult");
     }
 
     @ActivityCallback
-    private void onExportBackupResult(PluginCall call, ActivityResult result) {
-        String filename = pendingExportFilename != null ? pendingExportFilename : "renlian-backup.json";
-        String content = pendingExportContent;
-        pendingExportFilename = null;
-        pendingExportContent = null;
-
+    private void onPickExportFolderResult(PluginCall call, ActivityResult result) {
         if (call == null) return;
         if (result.getResultCode() != Activity.RESULT_OK || result.getData() == null) {
             JSObject ret = new JSObject();
@@ -461,50 +476,145 @@ public class StoragePickerPlugin extends Plugin {
         }
 
         Uri treeUri = result.getData().getData();
-        if (treeUri == null || content == null) {
+        if (treeUri == null) {
             JSObject ret = new JSObject();
             ret.put("cancelled", true);
             call.resolve(ret);
             return;
         }
 
+        try {
+            ContentResolver resolver = getContext().getContentResolver();
+            String parentDocId = DocumentsContract.getTreeDocumentId(treeUri);
+            Uri parentDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, parentDocId);
+            String folderName = queryDisplayName(resolver, parentDocUri);
+
+            JSObject ret = new JSObject();
+            ret.put("cancelled", false);
+            ret.put("treeUri", treeUri.toString());
+            ret.put("folderName", folderName != null ? folderName : "");
+            call.resolve(ret);
+        } catch (Exception ex) {
+            call.reject("无法访问所选文件夹: " + ex.getMessage());
+        }
+    }
+
+    @PluginMethod
+    public void beginBackupWrite(PluginCall call) {
+        String treeUriStr = call.getString("treeUri");
+        String filename = call.getString("filename", "renlian-backup.json");
+        if (treeUriStr == null || treeUriStr.isEmpty()) {
+            call.reject("缺少导出目录路径");
+            return;
+        }
+
         new Thread(() -> {
-            try {
-                ContentResolver resolver = getContext().getContentResolver();
-                String parentDocId = DocumentsContract.getTreeDocumentId(treeUri);
-                Uri parentDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, parentDocId);
-                String folderName = queryDisplayName(resolver, parentDocUri);
+            synchronized (backupIoLock) {
+                closeActiveExportStreamQuietly();
+                try {
+                    Uri treeUri = Uri.parse(treeUriStr);
+                    ContentResolver resolver = getContext().getContentResolver();
+                    String parentDocId = DocumentsContract.getTreeDocumentId(treeUri);
+                    Uri parentDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, parentDocId);
 
-                Uri createdUri = DocumentsContract.createDocument(
-                    resolver,
-                    parentDocUri,
-                    "application/json",
-                    filename
-                );
-                if (createdUri == null) {
-                    call.reject("无法在所选文件夹中创建备份文件");
-                    return;
-                }
-
-                try (OutputStream os = resolver.openOutputStream(createdUri, "wt")) {
-                    if (os == null) {
-                        call.reject("无法写入备份文件");
+                    Uri createdUri = DocumentsContract.createDocument(
+                        resolver,
+                        parentDocUri,
+                        "application/json",
+                        filename
+                    );
+                    if (createdUri == null) {
+                        call.reject("无法在所选文件夹中创建备份文件");
                         return;
                     }
-                    os.write(content.getBytes(StandardCharsets.UTF_8));
-                    os.flush();
-                }
 
-                String savedName = queryDisplayName(resolver, createdUri);
-                JSObject ret = new JSObject();
-                ret.put("cancelled", false);
-                ret.put("filename", savedName != null ? savedName : filename);
-                ret.put("folderName", folderName != null ? folderName : "");
-                call.resolve(ret);
-            } catch (Exception ex) {
-                call.reject("导出备份失败: " + ex.getMessage());
+                    OutputStream rawStream = resolver.openOutputStream(createdUri);
+                    if (rawStream == null) {
+                        call.reject("无法打开备份文件写入流");
+                        return;
+                    }
+
+                    activeExportStream = new BufferedOutputStream(rawStream, 65536);
+                    String savedName = queryDisplayName(resolver, createdUri);
+                    activeExportFilename = savedName != null ? savedName : filename;
+                    activeExportBytes = 0L;
+
+                    JSObject ret = new JSObject();
+                    ret.put("started", true);
+                    ret.put("filename", activeExportFilename);
+                    call.resolve(ret);
+                } catch (Exception ex) {
+                    closeActiveExportStreamQuietly();
+                    call.reject("创建备份文件失败: " + ex.getMessage());
+                }
             }
         }).start();
+    }
+
+    @PluginMethod
+    public void appendBackupChunk(PluginCall call) {
+        String chunk = call.getString("chunk", "");
+        new Thread(() -> {
+            synchronized (backupIoLock) {
+                if (activeExportStream == null) {
+                    call.reject("备份写入流未初始化");
+                    return;
+                }
+                try {
+                    byte[] bytes = chunk.getBytes(StandardCharsets.UTF_8);
+                    activeExportStream.write(bytes);
+                    activeExportBytes += bytes.length;
+                    JSObject ret = new JSObject();
+                    ret.put("ok", true);
+                    call.resolve(ret);
+                } catch (Exception ex) {
+                    closeActiveExportStreamQuietly();
+                    call.reject("写入备份数据失败: " + ex.getMessage());
+                }
+            }
+        }).start();
+    }
+
+    @PluginMethod
+    public void finishBackupWrite(PluginCall call) {
+        new Thread(() -> {
+            synchronized (backupIoLock) {
+                if (activeExportStream == null) {
+                    call.reject("没有正在进行的备份任务");
+                    return;
+                }
+                try {
+                    activeExportStream.flush();
+                    activeExportStream.close();
+                    String savedName = activeExportFilename;
+                    long totalBytes = activeExportBytes;
+                    activeExportStream = null;
+                    activeExportFilename = null;
+                    activeExportBytes = 0L;
+
+                    JSObject ret = new JSObject();
+                    ret.put("filename", savedName != null ? savedName : "renlian-backup.json");
+                    ret.put("bytesWritten", totalBytes);
+                    call.resolve(ret);
+                } catch (Exception ex) {
+                    closeActiveExportStreamQuietly();
+                    call.reject("完成备份写入失败: " + ex.getMessage());
+                }
+            }
+        }).start();
+    }
+
+    private void closeActiveExportStreamQuietly() {
+        if (activeExportStream != null) {
+            try {
+                activeExportStream.close();
+            } catch (Exception ignored) {
+                // Ignore close failure
+            }
+            activeExportStream = null;
+            activeExportFilename = null;
+            activeExportBytes = 0L;
+        }
     }
 
     @PluginMethod
@@ -539,7 +649,7 @@ public class StoragePickerPlugin extends Plugin {
                 ContentResolver resolver = getContext().getContentResolver();
                 String filename = queryDisplayName(resolver, fileUri);
                 ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                byte[] buffer = new byte[16384];
+                byte[] buffer = new byte[32768];
 
                 try (InputStream is = resolver.openInputStream(fileUri)) {
                     if (is == null) {
@@ -553,15 +663,48 @@ public class StoragePickerPlugin extends Plugin {
                 }
 
                 String content = new String(baos.toByteArray(), StandardCharsets.UTF_8);
+                synchronized (backupIoLock) {
+                    cachedRestoreContent = content;
+                }
+
                 JSObject ret = new JSObject();
                 ret.put("cancelled", false);
                 ret.put("filename", filename != null ? filename : "backup.json");
-                ret.put("content", content);
+                ret.put("totalChars", content.length());
                 call.resolve(ret);
             } catch (Exception ex) {
                 call.reject("读取备份文件失败: " + ex.getMessage());
             }
         }).start();
+    }
+
+    @PluginMethod
+    public void readBackupChunk(PluginCall call) {
+        int offset = call.getInt("offset", 0);
+        int length = call.getInt("length", 180000);
+        synchronized (backupIoLock) {
+            if (cachedRestoreContent == null) {
+                call.reject("备份读取缓存已失效，请重新选择备份文件");
+                return;
+            }
+            int total = cachedRestoreContent.length();
+            int safeStart = Math.max(0, Math.min(offset, total));
+            int safeEnd = Math.max(safeStart, Math.min(safeStart + Math.max(1, length), total));
+            String chunk = cachedRestoreContent.substring(safeStart, safeEnd);
+
+            JSObject ret = new JSObject();
+            ret.put("chunk", chunk);
+            ret.put("done", safeEnd >= total);
+            call.resolve(ret);
+        }
+    }
+
+    @PluginMethod
+    public void clearBackupReadCache(PluginCall call) {
+        synchronized (backupIoLock) {
+            cachedRestoreContent = null;
+        }
+        call.resolve();
     }
 
     private String queryDisplayName(ContentResolver resolver, Uri uri) {
@@ -584,7 +727,560 @@ public class StoragePickerPlugin extends Plugin {
 `;
 
   fs.writeFileSync(path.join(javaDir, 'StoragePickerPlugin.java'), storagePluginSource, 'utf8');
-  console.log('[prepare-android] Generated MainActivity.java (with safe display cutout insets) and StoragePickerPlugin.java.');
+
+  // 3. NativeFaceEnginePlugin.java: Flagship InsightFace SCRFD-10G + 5-Point Alignment + ArcFace ResNet50 (512D + Flip-TTA)
+  const nativeFaceEngineSource = `package com.mianpushiren.app;
+
+import ai.onnxruntime.OnnxTensor;
+import ai.onnxruntime.OnnxValue;
+import ai.onnxruntime.OrtEnvironment;
+import ai.onnxruntime.OrtSession;
+import android.content.Context;
+import android.content.res.AssetFileDescriptor;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Matrix;
+import android.graphics.Paint;
+import android.util.Base64;
+import com.getcapacitor.JSArray;
+import com.getcapacitor.JSObject;
+import com.getcapacitor.Plugin;
+import com.getcapacitor.PluginCall;
+import com.getcapacitor.PluginMethod;
+import com.getcapacitor.annotation.CapacitorPlugin;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.FloatBuffer;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+
+@CapacitorPlugin(name = "NativeFaceEngine")
+public class NativeFaceEnginePlugin extends Plugin {
+
+    private static final String ASSET_DET_MODEL = "insightface/det_10g.onnx";
+    private static final String ASSET_REC_MODEL = "insightface/w600k_r50.onnx";
+    private static final int DET_INPUT_SIZE = 640;
+    private static final int REC_INPUT_SIZE = 112;
+
+    // Canonical 5 facial landmarks for 112x112 ArcFace alignment (InsightFace norm_crop)
+    private static final float[][] ARCFACE_DST = new float[][] {
+        { 38.2946f, 51.6963f }, // left eye
+        { 73.5318f, 51.5014f }, // right eye
+        { 56.0252f, 71.7366f }, // nose tip
+        { 41.5493f, 92.3655f }, // left mouth corner
+        { 70.7299f, 92.2041f }  // right mouth corner
+    };
+
+    private final Object initLock = new Object();
+    private final Object inferLock = new Object();
+
+    private OrtEnvironment ortEnv = null;
+    private OrtSession detSession = null;
+    private OrtSession recSession = null;
+    private String detInputName = null;
+    private String recInputName = null;
+
+    private static class FaceBox {
+        float x1, y1, x2, y2, score;
+        float[][] kps = new float[5][2];
+    }
+
+    @PluginMethod
+    public void initialize(PluginCall call) {
+        new Thread(() -> {
+            try {
+                ensureSessionsReady();
+                JSObject ret = new JSObject();
+                ret.put("ready", true);
+                ret.put("engine", "insightface-r50");
+                ret.put("descriptorDim", 512);
+                call.resolve(ret);
+            } catch (Exception ex) {
+                call.reject("旗舰本地人脸模型初始化失败: " + ex.getMessage());
+            }
+        }).start();
+    }
+
+    @PluginMethod
+    public void analyzeImage(PluginCall call) {
+        String imageDataUrl = call.getString("imageDataUrl");
+        boolean primaryOnly = Boolean.TRUE.equals(call.getBoolean("primaryOnly", false));
+
+        if (imageDataUrl == null || imageDataUrl.isEmpty()) {
+            call.reject("缺少待识别图片数据");
+            return;
+        }
+
+        new Thread(() -> {
+            long startMs = System.currentTimeMillis();
+            Bitmap sourceBitmap = null;
+            try {
+                ensureSessionsReady();
+                sourceBitmap = decodeDataUrlToBitmap(imageDataUrl, 1600);
+                if (sourceBitmap == null) {
+                    call.reject("无法解码图片数据");
+                    return;
+                }
+
+                int imgW = sourceBitmap.getWidth();
+                int imgH = sourceBitmap.getHeight();
+
+                List<FaceBox> boxes;
+                synchronized (inferLock) {
+                    boxes = detectFacesScrfd(sourceBitmap, 0.45f, 0.40f);
+                    if (boxes.isEmpty()) {
+                        boxes = detectFacesScrfd(sourceBitmap, 0.30f, 0.40f);
+                    }
+                }
+
+                if (primaryOnly && boxes.size() > 1) {
+                    Collections.sort(boxes, (a, b) -> Float.compare(
+                        (b.x2 - b.x1) * (b.y2 - b.y1),
+                        (a.x2 - a.x1) * (a.y2 - a.y1)
+                    ));
+                    boxes = new ArrayList<>(boxes.subList(0, 1));
+                }
+
+                JSArray facesArray = new JSArray();
+                for (FaceBox fb : boxes) {
+                    Bitmap aligned = alignFace112(sourceBitmap, fb.kps);
+                    float[] embedding;
+                    try {
+                        synchronized (inferLock) {
+                            embedding = extractArcFaceEmbeddingWithFlip(aligned);
+                        }
+                    } finally {
+                        aligned.recycle();
+                    }
+
+                    String thumbDataUrl = cropPortraitThumbnail(sourceBitmap, fb, 240);
+
+                    JSArray descArr = new JSArray();
+                    for (float v : embedding) {
+                        descArr.put(v);
+                    }
+
+                    float nx = Math.max(0f, fb.x1 / imgW);
+                    float ny = Math.max(0f, fb.y1 / imgH);
+                    float nw = Math.min(1f - nx, Math.max(0.01f, (fb.x2 - fb.x1) / imgW));
+                    float nh = Math.min(1f - ny, Math.max(0.01f, (fb.y2 - fb.y1) / imgH));
+
+                    JSObject boxObj = new JSObject();
+                    boxObj.put("x", nx);
+                    boxObj.put("y", ny);
+                    boxObj.put("width", nw);
+                    boxObj.put("height", nh);
+
+                    JSObject faceObj = new JSObject();
+                    faceObj.put("descriptor", descArr);
+                    faceObj.put("box", boxObj);
+                    faceObj.put("score", fb.score);
+                    faceObj.put("thumbnail", thumbDataUrl);
+                    facesArray.put(faceObj);
+                }
+
+                JSObject ret = new JSObject();
+                ret.put("faces", facesArray);
+                ret.put("imageWidth", imgW);
+                ret.put("imageHeight", imgH);
+                ret.put("elapsedMs", Math.max(1L, System.currentTimeMillis() - startMs));
+                ret.put("engine", "insightface-r50");
+                call.resolve(ret);
+            } catch (Exception ex) {
+                call.reject("人脸特征提取失败: " + ex.getMessage());
+            } finally {
+                if (sourceBitmap != null && !sourceBitmap.isRecycled()) {
+                    sourceBitmap.recycle();
+                }
+            }
+        }).start();
+    }
+
+    private void ensureSessionsReady() throws Exception {
+        synchronized (initLock) {
+            if (detSession != null && recSession != null) {
+                return;
+            }
+            Context ctx = getContext();
+            File detFile = ensureAssetCopiedToFiles(ctx, ASSET_DET_MODEL, "det_10g.onnx");
+            File recFile = ensureAssetCopiedToFiles(ctx, ASSET_REC_MODEL, "w600k_r50.onnx");
+
+            if (ortEnv == null) {
+                ortEnv = OrtEnvironment.getEnvironment();
+            }
+
+            int threads = Math.max(2, Math.min(4, Runtime.getRuntime().availableProcessors() / 2));
+
+            try (OrtSession.SessionOptions opts = new OrtSession.SessionOptions()) {
+                opts.setIntraOpNumThreads(threads);
+                opts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT);
+
+                detSession = ortEnv.createSession(detFile.getAbsolutePath(), opts);
+                recSession = ortEnv.createSession(recFile.getAbsolutePath(), opts);
+                detInputName = detSession.getInputNames().iterator().next();
+                recInputName = recSession.getInputNames().iterator().next();
+            }
+        }
+    }
+
+    private File ensureAssetCopiedToFiles(Context ctx, String assetPath, String outName) throws IOException {
+        File dir = new File(ctx.getFilesDir(), "insightface");
+        if (!dir.exists() && !dir.mkdirs()) {
+            throw new IOException("无法创建模型缓存目录");
+        }
+        File outFile = new File(dir, outName);
+
+        long expectedLen = -1L;
+        try (AssetFileDescriptor afd = ctx.getAssets().openFd(assetPath)) {
+            expectedLen = afd.getLength();
+        } catch (Exception ignored) {
+            // Fall back to copying if asset is compressed
+        }
+
+        if (outFile.exists() && expectedLen > 0 && outFile.length() == expectedLen) {
+            return outFile;
+        }
+
+        File tmpFile = new File(dir, outName + ".tmp");
+        try (InputStream is = ctx.getAssets().open(assetPath);
+             FileOutputStream fos = new FileOutputStream(tmpFile)) {
+            byte[] buf = new byte[65536];
+            int n;
+            while ((n = is.read(buf)) != -1) {
+                fos.write(buf, 0, n);
+            }
+            fos.flush();
+        }
+
+        if (outFile.exists()) {
+            outFile.delete();
+        }
+        if (!tmpFile.renameTo(outFile)) {
+            throw new IOException("无法保存本地模型文件: " + outName);
+        }
+        return outFile;
+    }
+
+    private Bitmap decodeDataUrlToBitmap(String dataUrl, int maxDim) {
+        int commaIdx = dataUrl.indexOf(',');
+        String b64 = commaIdx >= 0 ? dataUrl.substring(commaIdx + 1) : dataUrl;
+        byte[] bytes = Base64.decode(b64, Base64.DEFAULT);
+
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.length, bounds);
+
+        int sampleSize = 1;
+        int maxSide = Math.max(bounds.outWidth, bounds.outHeight);
+        while (maxSide / sampleSize > maxDim) {
+            sampleSize *= 2;
+        }
+
+        BitmapFactory.Options opts = new BitmapFactory.Options();
+        opts.inSampleSize = sampleSize;
+        opts.inPreferredConfig = Bitmap.Config.ARGB_8888;
+        return BitmapFactory.decodeByteArray(bytes, 0, bytes.length, opts);
+    }
+
+    private List<FaceBox> detectFacesScrfd(Bitmap src, float scoreThreshold, float iouThreshold) throws Exception {
+        int srcW = src.getWidth();
+        int srcH = src.getHeight();
+        float detScale = Math.min((float) DET_INPUT_SIZE / srcW, (float) DET_INPUT_SIZE / srcH);
+        int newW = Math.max(1, Math.min(DET_INPUT_SIZE, Math.round(srcW * detScale)));
+        int newH = Math.max(1, Math.min(DET_INPUT_SIZE, Math.round(srcH * detScale)));
+
+        Bitmap letterbox = Bitmap.createBitmap(DET_INPUT_SIZE, DET_INPUT_SIZE, Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(letterbox);
+        canvas.drawColor(Color.BLACK);
+        Bitmap resized = Bitmap.createScaledBitmap(src, newW, newH, true);
+        canvas.drawBitmap(resized, 0f, 0f, null);
+        if (resized != src) {
+            resized.recycle();
+        }
+
+        int area = DET_INPUT_SIZE * DET_INPUT_SIZE;
+        int[] pixels = new int[area];
+        letterbox.getPixels(pixels, 0, DET_INPUT_SIZE, 0, 0, DET_INPUT_SIZE, DET_INPUT_SIZE);
+        letterbox.recycle();
+
+        // InsightFace det_10g expects RGB NCHW normalized by (x - 127.5) / 128.0
+        float[] inputData = new float[3 * area];
+        for (int i = 0; i < area; i++) {
+            int p = pixels[i];
+            float r = ((p >> 16) & 0xFF);
+            float g = ((p >> 8) & 0xFF);
+            float b = (p & 0xFF);
+            inputData[i] = (r - 127.5f) / 128.0f;
+            inputData[area + i] = (g - 127.5f) / 128.0f;
+            inputData[2 * area + i] = (b - 127.5f) / 128.0f;
+        }
+
+        long[] shape = new long[] { 1, 3, DET_INPUT_SIZE, DET_INPUT_SIZE };
+        float[][] scoreArrs = new float[3][];
+        float[][] bboxArrs = new float[3][];
+        float[][] kpsArrs = new float[3][];
+
+        try (OnnxTensor inputTensor = OnnxTensor.createTensor(ortEnv, FloatBuffer.wrap(inputData), shape);
+             OrtSession.Result results = detSession.run(Collections.singletonMap(detInputName, inputTensor))) {
+
+            int outCount = results.size();
+            for (int i = 0; i < outCount; i++) {
+                OnnxValue val = results.get(i);
+                if (!(val instanceof OnnxTensor)) continue;
+                OnnxTensor tensor = (OnnxTensor) val;
+                long[] outShape = tensor.getInfo().getShape();
+                int lastDim = (int) outShape[outShape.length - 1];
+                FloatBuffer fb = tensor.getFloatBuffer();
+                float[] data = new float[fb.remaining()];
+                fb.get(data);
+
+                int numRows = data.length / Math.max(1, lastDim);
+                int strideIdx = -1;
+                if (numRows == 12800) strideIdx = 0;
+                else if (numRows == 3200) strideIdx = 1;
+                else if (numRows == 800) strideIdx = 2;
+
+                if (strideIdx < 0) continue;
+                if (lastDim == 1) scoreArrs[strideIdx] = data;
+                else if (lastDim == 4) bboxArrs[strideIdx] = data;
+                else if (lastDim == 10) kpsArrs[strideIdx] = data;
+            }
+        }
+
+        int[] strides = new int[] { 8, 16, 32 };
+        List<FaceBox> proposals = new ArrayList<>();
+
+        for (int sIdx = 0; sIdx < 3; sIdx++) {
+            float[] scores = scoreArrs[sIdx];
+            float[] bboxes = bboxArrs[sIdx];
+            float[] kps = kpsArrs[sIdx];
+            if (scores == null || bboxes == null || kps == null) continue;
+
+            int stride = strides[sIdx];
+            int gridW = DET_INPUT_SIZE / stride;
+            int gridH = DET_INPUT_SIZE / stride;
+
+            for (int row = 0; row < gridH; row++) {
+                float cy = row * stride;
+                for (int col = 0; col < gridW; col++) {
+                    float cx = col * stride;
+                    int cellBase = (row * gridW + col) * 2;
+                    for (int a = 0; a < 2; a++) {
+                        int idx = cellBase + a;
+                        float sc = scores[idx];
+                        if (sc < scoreThreshold) continue;
+
+                        FaceBox fb = new FaceBox();
+                        fb.score = sc;
+                        int bBase = idx * 4;
+                        fb.x1 = Math.max(0f, (cx - bboxes[bBase] * stride) / detScale);
+                        fb.y1 = Math.max(0f, (cy - bboxes[bBase + 1] * stride) / detScale);
+                        fb.x2 = Math.min((float) srcW, (cx + bboxes[bBase + 2] * stride) / detScale);
+                        fb.y2 = Math.min((float) srcH, (cy + bboxes[bBase + 3] * stride) / detScale);
+
+                        if (fb.x2 - fb.x1 < 12f || fb.y2 - fb.y1 < 12f) continue;
+
+                        int kBase = idx * 10;
+                        for (int k = 0; k < 5; k++) {
+                            fb.kps[k][0] = (cx + kps[kBase + 2 * k] * stride) / detScale;
+                            fb.kps[k][1] = (cy + kps[kBase + 2 * k + 1] * stride) / detScale;
+                        }
+                        proposals.add(fb);
+                    }
+                }
+            }
+        }
+
+        return applyNms(proposals, iouThreshold);
+    }
+
+    private List<FaceBox> applyNms(List<FaceBox> proposals, float iouThreshold) {
+        Collections.sort(proposals, new Comparator<FaceBox>() {
+            @Override
+            public int compare(FaceBox a, FaceBox b) {
+                return Float.compare(b.score, a.score);
+            }
+        });
+
+        List<FaceBox> kept = new ArrayList<>();
+        boolean[] suppressed = new boolean[proposals.size()];
+
+        for (int i = 0; i < proposals.size(); i++) {
+            if (suppressed[i]) continue;
+            FaceBox a = proposals.get(i);
+            kept.add(a);
+            float areaA = Math.max(0f, a.x2 - a.x1) * Math.max(0f, a.y2 - a.y1);
+
+            for (int j = i + 1; j < proposals.size(); j++) {
+                if (suppressed[j]) continue;
+                FaceBox b = proposals.get(j);
+                float xx1 = Math.max(a.x1, b.x1);
+                float yy1 = Math.max(a.y1, b.y1);
+                float xx2 = Math.min(a.x2, b.x2);
+                float yy2 = Math.min(a.y2, b.y2);
+                float inter = Math.max(0f, xx2 - xx1) * Math.max(0f, yy2 - yy1);
+                float areaB = Math.max(0f, b.x2 - b.x1) * Math.max(0f, b.y2 - b.y1);
+                float iou = inter / (areaA + areaB - inter + 1e-6f);
+                if (iou > iouThreshold) {
+                    suppressed[j] = true;
+                }
+            }
+        }
+        return kept;
+    }
+
+    /**
+     * Exact 2D similarity transform (Umeyama least-squares rotation + uniform scale + translation)
+     * mapping the 5 detected facial landmarks onto ArcFace's canonical 112x112 coordinates.
+     */
+    private Bitmap alignFace112(Bitmap src, float[][] srcPts) {
+        double mx = 0, my = 0, nx = 0, ny = 0;
+        for (int i = 0; i < 5; i++) {
+            mx += srcPts[i][0];
+            my += srcPts[i][1];
+            nx += ARCFACE_DST[i][0];
+            ny += ARCFACE_DST[i][1];
+        }
+        mx /= 5.0;
+        my /= 5.0;
+        nx /= 5.0;
+        ny /= 5.0;
+
+        double denom = 0, numA = 0, numB = 0;
+        for (int i = 0; i < 5; i++) {
+            double sx = srcPts[i][0] - mx;
+            double sy = srcPts[i][1] - my;
+            double dx = ARCFACE_DST[i][0] - nx;
+            double dy = ARCFACE_DST[i][1] - ny;
+            denom += sx * sx + sy * sy;
+            numA += sx * dx + sy * dy;
+            numB += sx * dy - sy * dx;
+        }
+
+        double a = denom > 1e-6 ? numA / denom : 1.0;
+        double b = denom > 1e-6 ? numB / denom : 0.0;
+        double tx = nx - (a * mx - b * my);
+        double ty = ny - (b * mx + a * my);
+
+        Matrix matrix = new Matrix();
+        matrix.setValues(new float[] {
+            (float) a, (float) -b, (float) tx,
+            (float) b, (float) a, (float) ty,
+            0f, 0f, 1f
+        });
+
+        Bitmap aligned = Bitmap.createBitmap(REC_INPUT_SIZE, REC_INPUT_SIZE, Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(aligned);
+        Paint paint = new Paint(Paint.FILTER_BITMAP_FLAG | Paint.ANTI_ALIAS_FLAG);
+        canvas.drawBitmap(src, matrix, paint);
+        return aligned;
+    }
+
+    /**
+     * Runs ArcFace ResNet50 (w600k_r50.onnx) on both original and horizontally flipped
+     * 112x112 aligned faces (Flip-TTA) and returns an L2-normalized 512D embedding.
+     */
+    private float[] extractArcFaceEmbeddingWithFlip(Bitmap aligned) throws Exception {
+        int area = REC_INPUT_SIZE * REC_INPUT_SIZE;
+        int[] pixels = new int[area];
+        aligned.getPixels(pixels, 0, REC_INPUT_SIZE, 0, 0, REC_INPUT_SIZE, REC_INPUT_SIZE);
+
+        float[] embOrig = runArcFaceSingle(pixels, false);
+        float[] embFlip = runArcFaceSingle(pixels, true);
+
+        int dim = embOrig.length;
+        float[] merged = new float[dim];
+        double normSq = 0.0;
+        for (int i = 0; i < dim; i++) {
+            float v = embOrig[i] + embFlip[i];
+            merged[i] = v;
+            normSq += (double) v * (double) v;
+        }
+
+        double norm = Math.sqrt(normSq);
+        if (norm > 1e-8) {
+            for (int i = 0; i < dim; i++) {
+                merged[i] = (float) (merged[i] / norm);
+            }
+        }
+        return merged;
+    }
+
+    private float[] runArcFaceSingle(int[] pixels, boolean flipHorizontal) throws Exception {
+        int area = REC_INPUT_SIZE * REC_INPUT_SIZE;
+        float[] input = new float[3 * area];
+
+        // InsightFace w600k_r50 expects RGB NCHW normalized by (x - 127.5) / 127.5
+        for (int y = 0; y < REC_INPUT_SIZE; y++) {
+            int rowOffset = y * REC_INPUT_SIZE;
+            for (int x = 0; x < REC_INPUT_SIZE; x++) {
+                int srcX = flipHorizontal ? (REC_INPUT_SIZE - 1 - x) : x;
+                int p = pixels[rowOffset + srcX];
+                int dstIdx = rowOffset + x;
+                float r = ((p >> 16) & 0xFF);
+                float g = ((p >> 8) & 0xFF);
+                float b = (p & 0xFF);
+                input[dstIdx] = (r - 127.5f) / 127.5f;
+                input[area + dstIdx] = (g - 127.5f) / 127.5f;
+                input[2 * area + dstIdx] = (b - 127.5f) / 127.5f;
+            }
+        }
+
+        long[] shape = new long[] { 1, 3, REC_INPUT_SIZE, REC_INPUT_SIZE };
+        try (OnnxTensor inputTensor = OnnxTensor.createTensor(ortEnv, FloatBuffer.wrap(input), shape);
+             OrtSession.Result results = recSession.run(Collections.singletonMap(recInputName, inputTensor))) {
+            OnnxTensor outTensor = (OnnxTensor) results.get(0);
+            FloatBuffer fb = outTensor.getFloatBuffer();
+            float[] raw = new float[fb.remaining()];
+            fb.get(raw);
+            return raw;
+        }
+    }
+
+    private String cropPortraitThumbnail(Bitmap src, FaceBox fb, int outSize) {
+        int srcW = src.getWidth();
+        int srcH = src.getHeight();
+        float bw = fb.x2 - fb.x1;
+        float bh = fb.y2 - fb.y1;
+
+        float padX = bw * 0.34f;
+        float padTop = bh * 0.42f;
+        float padBottom = bh * 0.28f;
+
+        float rawX = Math.max(0f, fb.x1 - padX);
+        float rawY = Math.max(0f, fb.y1 - padTop);
+        float rawW = Math.min(srcW - rawX, bw + padX * 2f);
+        float rawH = Math.min(srcH - rawY, bh + padTop + padBottom);
+
+        float side = Math.min(Math.max(rawW, rawH), Math.min(srcW, srcH));
+        float cx = rawX + rawW / 2f;
+        float cy = rawY + rawH / 2f;
+        int cropX = Math.max(0, Math.min(srcW - Math.round(side), Math.round(cx - side / 2f)));
+        int cropY = Math.max(0, Math.min(srcH - Math.round(side), Math.round(cy - side / 2f)));
+        int cropSide = Math.max(1, Math.min(Math.round(side), Math.min(srcW - cropX, srcH - cropY)));
+
+        Bitmap crop = Bitmap.createBitmap(src, cropX, cropY, cropSide, cropSide);
+        Bitmap scaled = Bitmap.createScaledBitmap(crop, outSize, outSize, true);
+        if (scaled != crop) {
+            crop.recycle();
+        }
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        scaled.compress(Bitmap.CompressFormat.JPEG, 86, baos);
+        scaled.recycle();
+        return "data:image/jpeg;base64," + Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP);
+    }
+}
+`;
+
+  fs.writeFileSync(path.join(javaDir, 'NativeFaceEnginePlugin.java'), nativeFaceEngineSource, 'utf8');
+  console.log('[prepare-android] Generated MainActivity.java, StoragePickerPlugin.java, and NativeFaceEnginePlugin.java (InsightFace SCRFD + ArcFace R50).');
 }
 
 // ---------------------------------------------------------------------------
@@ -1048,7 +1744,7 @@ if (mode === 'icons' || mode === 'all') {
 }
 if (mode === 'manifest' || mode === 'all') {
   patchAndroidManifest();
-  patchAndroidVersionCode();
+  patchAndroidBuildGradle();
   writeNativeAndroidSources();
   writeAndroidIconsAndSplash();
 }
