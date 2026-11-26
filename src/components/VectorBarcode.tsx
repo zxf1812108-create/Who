@@ -14,7 +14,7 @@ export const VectorBarcode: React.FC<VectorBarcodeProps> = ({ descriptor }) => {
   return (
     <div className="space-y-2">
       <div
-        className="flex items-center gap-[1px] h-12 px-2 py-1.5 bg-slate-50 border border-slate-200/80 rounded-xl overflow-hidden"
+        className="flex items-center gap-[1px] h-12 px-2 py-1.5 bg-[#F8F8F7] border border-neutral-200/80 rounded-xl overflow-hidden"
         aria-label="128维人脸特征向量分布图"
       >
         {descriptor.map((val, idx) => {
@@ -28,7 +28,7 @@ export const VectorBarcode: React.FC<VectorBarcodeProps> = ({ descriptor }) => {
             >
               <div
                 className={`w-full rounded-[1px] ${
-                  isPositive ? 'bg-blue-600/80' : 'bg-slate-400/70'
+                  isPositive ? 'bg-neutral-900/80' : 'bg-neutral-400/65'
                 }`}
                 style={{ height: `${heightPct}%` }}
               />

@@ -6,13 +6,22 @@ on:
       - main
       - master
   workflow_dispatch:
+    inputs:
+      build_type:
+        description: '构建类型 (release 正式版 / debug 调试版)'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
 
 permissions:
   contents: read
 
 jobs:
   build-apk:
-    name: Build Android Debug APK
+    name: Build Android APK
     runs-on: ubuntu-latest
 
     steps:
@@ -60,22 +69,77 @@ jobs:
       - name: 注入相机与相册权限到 AndroidManifest.xml
         run: node scripts/prepare-android.mjs manifest
 
-      - name: 编译生成 Android APK
-        working-directory: android
-        run: |
-          chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon
-
-      - name: 整理输出 APK 文件
+      - name: 编译并签名 Android APK
+        env:
+          BUILD_TYPE: ${{ inputs.build_type || 'release' }}
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           mkdir -p release
-          cp android/app/build/outputs/apk/debug/app-debug.apk release/mianpushiren-debug.apk
-          ls -lh release/mianpushiren-debug.apk
+          chmod +x android/gradlew
+
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            (cd android && ./gradlew assembleDebug --no-daemon)
+            cp android/app/build/outputs/apk/debug/app-debug.apk release/mianpushiren-debug.apk
+            echo "APK_PATH=release/mianpushiren-debug.apk" >> "$GITHUB_ENV"
+            echo "ARTIFACT_NAME=mianpushiren-android-debug-apk" >> "$GITHUB_ENV"
+          else
+            (cd android && ./gradlew assembleRelease --no-daemon)
+
+            UNSIGNED_APK="android/app/build/outputs/apk/release/app-release-unsigned.apk"
+            if [ ! -f "$UNSIGNED_APK" ]; then
+              UNSIGNED_APK="android/app/build/outputs/apk/release/app-release.apk"
+            fi
+
+            BUILD_TOOLS_DIR="$(ls -d "$ANDROID_HOME/build-tools"/* | sort -V | tail -n 1)"
+            echo "Using Android build-tools: $BUILD_TOOLS_DIR"
+
+            "$BUILD_TOOLS_DIR/zipalign" -f -p 4 "$UNSIGNED_APK" /tmp/mianpushiren-aligned.apk
+
+            KEYSTORE_FILE="/tmp/release-signing.jks"
+            if [ -n "$KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ]; then
+              echo "Using configured GitHub Secrets release keystore."
+              printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_FILE"
+              STORE_PASS="$KEYSTORE_PASSWORD"
+              ALIAS_NAME="$KEY_ALIAS"
+              ALIAS_PASS="${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
+            else
+              echo "No custom keystore secrets detected; generating temporary signing key for installable Release APK."
+              STORE_PASS="$(openssl rand -hex 16)"
+              ALIAS_PASS="$STORE_PASS"
+              ALIAS_NAME="mianpushiren"
+              keytool -genkeypair -v \
+                -keystore "$KEYSTORE_FILE" \
+                -alias "$ALIAS_NAME" \
+                -keyalg RSA -keysize 2048 -validity 10000 \
+                -storepass "$STORE_PASS" \
+                -keypass "$ALIAS_PASS" \
+                -dname "CN=MianPuShiRen, OU=Mobile, O=MianPuShiRen, L=Shanghai, S=Shanghai, C=CN"
+            fi
+
+            "$BUILD_TOOLS_DIR/apksigner" sign \
+              --ks "$KEYSTORE_FILE" \
+              --ks-key-alias "$ALIAS_NAME" \
+              --ks-pass "pass:$STORE_PASS" \
+              --key-pass "pass:$ALIAS_PASS" \
+              --out release/mianpushiren-release.apk \
+              /tmp/mianpushiren-aligned.apk
+
+            "$BUILD_TOOLS_DIR/apksigner" verify release/mianpushiren-release.apk
+            rm -f "$KEYSTORE_FILE" /tmp/mianpushiren-aligned.apk
+
+            echo "APK_PATH=release/mianpushiren-release.apk" >> "$GITHUB_ENV"
+            echo "ARTIFACT_NAME=mianpushiren-android-release-apk" >> "$GITHUB_ENV"
+          fi
+
+          ls -lh release/
 
       - name: 上传 APK 构建产物
         uses: actions/upload-artifact@v4
         with:
-          name: mianpushiren-android-apk
-          path: release/mianpushiren-debug.apk
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.APK_PATH }}
           if-no-files-found: error
           retention-days: 30

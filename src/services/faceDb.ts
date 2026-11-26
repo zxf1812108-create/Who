@@ -1,4 +1,4 @@
-import type { PersonRecord, RecognitionHistoryEntry } from '../types/face';
+import type { PersonRecord } from '../types/face';
 
 const DB_NAME = 'FaceRosterAndroidDB';
 const DB_VERSION = 1;
@@ -36,6 +36,24 @@ function openDatabase(): Promise<IDBDatabase> {
   return dbPromise;
 }
 
+/**
+ * Default sort: if any records have a saved manual sortOrder, respect sortOrder first,
+ * falling back to Chinese alphabetical name order.
+ */
+export function sortPersonsList(list: PersonRecord[]): PersonRecord[] {
+  const hasManualOrder = list.some((p) => typeof p.sortOrder === 'number');
+  return [...list].sort((a, b) => {
+    if (hasManualOrder) {
+      const orderA =
+        typeof a.sortOrder === 'number' ? a.sortOrder : Number.MAX_SAFE_INTEGER;
+      const orderB =
+        typeof b.sortOrder === 'number' ? b.sortOrder : Number.MAX_SAFE_INTEGER;
+      if (orderA !== orderB) return orderA - orderB;
+    }
+    return a.name.localeCompare(b.name, 'zh-CN');
+  });
+}
+
 export async function getAllPersons(): Promise<PersonRecord[]> {
   const db = await openDatabase();
   return new Promise((resolve, reject) => {
@@ -44,8 +62,7 @@ export async function getAllPersons(): Promise<PersonRecord[]> {
     const req = store.getAll();
     req.onsuccess = () => {
       const list = (req.result as PersonRecord[]) || [];
-      list.sort((a, b) => b.updatedAt - a.updatedAt);
-      resolve(list);
+      resolve(sortPersonsList(list));
     };
     req.onerror = () => reject(req.error);
   });
@@ -61,65 +78,24 @@ export async function putPerson(person: PersonRecord): Promise<void> {
   });
 }
 
+export async function putPersonsBatch(persons: PersonRecord[]): Promise<void> {
+  const db = await openDatabase();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_PERSONS, 'readwrite');
+    const store = tx.objectStore(STORE_PERSONS);
+    for (const person of persons) {
+      store.put(person);
+    }
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
 export async function deletePersonById(id: string): Promise<void> {
   const db = await openDatabase();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_PERSONS, 'readwrite');
     tx.objectStore(STORE_PERSONS).delete(id);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
-}
-
-export async function clearAllPersons(): Promise<void> {
-  const db = await openDatabase();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_PERSONS, 'readwrite');
-    tx.objectStore(STORE_PERSONS).clear();
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
-}
-
-export async function getAllHistory(): Promise<RecognitionHistoryEntry[]> {
-  const db = await openDatabase();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_HISTORY, 'readonly');
-    const req = tx.objectStore(STORE_HISTORY).getAll();
-    req.onsuccess = () => {
-      const list = (req.result as RecognitionHistoryEntry[]) || [];
-      list.sort((a, b) => b.timestamp - a.timestamp);
-      resolve(list);
-    };
-    req.onerror = () => reject(req.error);
-  });
-}
-
-export async function addHistoryEntry(entry: RecognitionHistoryEntry): Promise<void> {
-  const db = await openDatabase();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_HISTORY, 'readwrite');
-    tx.objectStore(STORE_HISTORY).put(entry);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
-}
-
-export async function deleteHistoryEntry(id: string): Promise<void> {
-  const db = await openDatabase();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_HISTORY, 'readwrite');
-    tx.objectStore(STORE_HISTORY).delete(id);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
-}
-
-export async function clearAllHistory(): Promise<void> {
-  const db = await openDatabase();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_HISTORY, 'readwrite');
-    tx.objectStore(STORE_HISTORY).clear();
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
@@ -168,6 +144,7 @@ export function parseBackupJson(rawText: string): PersonRecord[] {
           name: item.name.trim() || '未命名人物',
           note: typeof item.note === 'string' ? item.note : '',
           samples: validSamples,
+          sortOrder: typeof item.sortOrder === 'number' ? item.sortOrder : undefined,
           createdAt: typeof item.createdAt === 'number' ? item.createdAt : Date.now(),
           updatedAt: typeof item.updatedAt === 'number' ? item.updatedAt : Date.now(),
         });

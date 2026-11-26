@@ -81,9 +81,19 @@ export function parsePersonNameFromFilename(
 export function distanceToSimilarity(distance: number): number {
   if (distance <= 0.15) return 99;
   if (distance >= 0.95) return 5;
-  // Smooth calibrated curve: 0.30 -> ~90%, 0.45 -> ~78%, 0.55 -> ~64%, 0.65 -> ~45%
+  // Smooth calibrated curve: 0.30 -> ~83%, 0.42 -> ~70%, 0.50 -> ~60%, 0.58 -> ~50%
   const normalized = Math.max(0, Math.min(1, 1 - Math.pow(distance / 0.88, 1.65)));
   return Math.round(normalized * 100);
+}
+
+/**
+ * Converts a user-facing minimum similarity percentage (40 - 85) into
+ * the corresponding internal 128D Euclidean distance cutoff.
+ */
+export function similarityToDistance(similarityPercent: number): number {
+  const clamped = Math.max(10, Math.min(99, similarityPercent));
+  const dist = 0.88 * Math.pow(1 - clamped / 100, 1 / 1.65);
+  return Number(dist.toFixed(4));
 }
 
 /**

@@ -1,176 +1,251 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import {
-  Camera,
-  CheckCircle2,
-  FlipHorizontal2,
-  Image as ImageIcon,
-  Loader2,
-  RefreshCw,
-  ScanFace,
-  UserCheck,
-  UserPlus,
-  Users,
-  Video,
-  VideoOff,
-  AlertTriangle,
-} from 'lucide-react';
-import type {
-  EngineState,
-  PersonRecord,
-  RecognitionHistoryEntry,
-  RecognizedFace,
-} from '../types/face';
-import {
-  createSnapshotDataUrl,
-  distanceToSimilarity,
-  loadImageElement,
-  readFileAsDataUrl,
-  recognizeFacesInSource,
-} from '../services/faceEngine';
+import { Camera, Loader2, ScanFace, UserPlus, Video } from 'lucide-react';
 import * as faceapi from '@vladmandic/face-api';
-import { SAMPLE_PROFILES } from '../data/sampleProfiles';
+import type { EngineState, PersonRecord, RecognizedFace } from '../types/face';
+import {
+  distanceToSimilarity,
+  recognizeFacesInSource,
+  similarityToDistance,
+} from '../services/faceEngine';
 
 interface CameraRecognizeViewProps {
   persons: PersonRecord[];
   engineState: EngineState;
-  threshold: number;
-  onChangeThreshold: (value: number) => void;
+  minSimilarity: number;
   onQuickRegisterFace: (
     name: string,
     note: string,
     descriptor: number[],
     thumbnail: string
   ) => Promise<PersonRecord>;
-  onRecordHistory: (entry: RecognitionHistoryEntry) => Promise<void>;
-  onGoToImport: () => void;
-  onImportSamples: () => Promise<void>;
-  isImporting: boolean;
 }
 
-const THRESHOLD_PRESETS = [
-  { label: '严格', value: 0.44, desc: '防误识优先' },
-  { label: '标准', value: 0.52, desc: '推荐平衡' },
-  { label: '宽松', value: 0.6, desc: '逆光/侧脸兼容' },
-] as const;
+interface ZoomCapabilities extends MediaTrackCapabilities {
+  zoom?: {
+    min: number;
+    max: number;
+    step?: number;
+  };
+}
+
+interface ZoomSettings extends MediaTrackSettings {
+  zoom?: number;
+}
+
+interface ZoomConstraintSet extends MediaTrackConstraintSet {
+  zoom?: number;
+}
+
+function getTouchDistance(t1: React.Touch, t2: React.Touch): number {
+  return Math.hypot(t1.clientX - t2.clientX, t1.clientY - t2.clientY);
+}
 
 export const CameraRecognizeView: React.FC<CameraRecognizeViewProps> = ({
   persons,
   engineState,
-  threshold,
-  onChangeThreshold,
+  minSimilarity,
   onQuickRegisterFace,
-  onRecordHistory,
-  onGoToImport,
-  onImportSamples,
-  isImporting,
 }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const albumInputRef = useRef<HTMLInputElement>(null);
-  const liveLoopTimerRef = useRef<number | null>(null);
-  const liveBusyRef = useRef(false);
+  const videoTrackRef = useRef<MediaStreamTrack | null>(null);
 
   const [cameraActive, setCameraActive] = useState(false);
   const [cameraStarting, setCameraStarting] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
-  const [facingMode, setFacingMode] = useState<'environment' | 'user'>('user');
-  const [liveTracking, setLiveTracking] = useState(true);
-  const [liveFaces, setLiveFaces] = useState<RecognizedFace[]>([]);
-  const [liveElapsedMs, setLiveElapsedMs] = useState<number | null>(null);
 
-  // Captured / analyzed photo state
-  const [capturedImageUrl, setCapturedImageUrl] = useState<string | null>(null);
+  // Hardware + fallback digital zoom state
+  const [zoom, setZoom] = useState(1);
+  const [minZoom, setMinZoom] = useState(1);
+  const [maxZoom, setMaxZoom] = useState(4);
+  const [hardwareZoomSupported, setHardwareZoomSupported] = useState(false);
+  const [zoomBadgeVisible, setZoomBadgeVisible] = useState(false);
+
+  const zoomStepRef = useRef(0.1);
+  const zoomRef = useRef(1);
+  zoomRef.current = zoom;
+  const zoomApplyingRef = useRef(false);
+  const pendingZoomRef = useRef<number | null>(null);
+  const zoomBadgeTimerRef = useRef<number | null>(null);
+  const pinchStateRef = useRef<{
+    startDist: number;
+    startZoom: number;
+  } | null>(null);
+
   const [capturedFaces, setCapturedFaces] = useState<RecognizedFace[]>([]);
-  const [capturedElapsedMs, setCapturedElapsedMs] = useState<number | null>(null);
   const [selectedFaceId, setSelectedFaceId] = useState<string | null>(null);
+  const [elapsedMs, setElapsedMs] = useState<number | null>(null);
+  const [hasAttemptedCapture, setHasAttemptedCapture] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [shutterFlash, setShutterFlash] = useState(false);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
 
-  // Quick register unknown face state
   const [registerName, setRegisterName] = useState('');
-  const [registerNote, setRegisterNote] = useState('');
   const [registering, setRegistering] = useState(false);
 
-  const stopCamera = useCallback(() => {
-    if (liveLoopTimerRef.current !== null) {
-      window.clearTimeout(liveLoopTimerRef.current);
-      liveLoopTimerRef.current = null;
+  const internalCutoff = useMemo(
+    () => similarityToDistance(minSimilarity),
+    [minSimilarity]
+  );
+
+  const showZoomBadgeBriefly = useCallback(() => {
+    setZoomBadgeVisible(true);
+    if (zoomBadgeTimerRef.current !== null) {
+      window.clearTimeout(zoomBadgeTimerRef.current);
     }
+    zoomBadgeTimerRef.current = window.setTimeout(() => {
+      setZoomBadgeVisible(false);
+    }, 1600);
+  }, []);
+
+  const applyZoomValue = useCallback(
+    async (rawNextZoom: number) => {
+      const clamped = Math.max(minZoom, Math.min(maxZoom, rawNextZoom));
+      const step = zoomStepRef.current;
+      const snapped =
+        step > 0
+          ? Math.round((clamped - minZoom) / step) * step + minZoom
+          : clamped;
+      const cleanZoom = Number(
+        Math.max(minZoom, Math.min(maxZoom, snapped)).toFixed(2)
+      );
+
+      setZoom(cleanZoom);
+      showZoomBadgeBriefly();
+
+      if (!hardwareZoomSupported || !videoTrackRef.current) {
+        return;
+      }
+
+      if (zoomApplyingRef.current) {
+        pendingZoomRef.current = cleanZoom;
+        return;
+      }
+
+      zoomApplyingRef.current = true;
+      try {
+        let target: number | null = cleanZoom;
+        while (target !== null && videoTrackRef.current) {
+          pendingZoomRef.current = null;
+          const constraint: ZoomConstraintSet = { zoom: target };
+          await videoTrackRef.current.applyConstraints({
+            advanced: [constraint],
+          });
+          target = pendingZoomRef.current;
+        }
+      } catch {
+        // Ignore transient hardware zoom rejections
+      } finally {
+        zoomApplyingRef.current = false;
+      }
+    },
+    [hardwareZoomSupported, maxZoom, minZoom, showZoomBadgeBriefly]
+  );
+
+  const stopCamera = useCallback(() => {
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
     }
+    videoTrackRef.current = null;
     if (videoRef.current) {
       videoRef.current.srcObject = null;
     }
     setCameraActive(false);
-    setLiveFaces([]);
   }, []);
 
-  const startCamera = useCallback(
-    async (requestedFacing: 'environment' | 'user' = facingMode) => {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        setCameraError('当前浏览器不支持摄像头访问，请使用下方「相册选图」进行照片识别。');
-        return;
-      }
+  const startRearCamera = useCallback(async () => {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setCameraError('当前设备不支持调用摄像头。');
+      return;
+    }
 
-      stopCamera();
-      setCameraStarting(true);
-      setCameraError(null);
-      setCapturedImageUrl(null);
-      setCapturedFaces([]);
-      setSelectedFaceId(null);
-      setAnalysisError(null);
+    stopCamera();
+    setCameraStarting(true);
+    setCameraError(null);
 
+    try {
+      let stream: MediaStream;
       try {
-        let stream: MediaStream;
-        try {
-          stream = await navigator.mediaDevices.getUserMedia({
-            video: {
-              facingMode: { ideal: requestedFacing },
-              width: { ideal: 1280 },
-              height: { ideal: 960 },
-            },
-            audio: false,
-          });
-        } catch {
-          // Fallback without facingMode constraint on desktop cameras
-          stream = await navigator.mediaDevices.getUserMedia({
-            video: true,
-            audio: false,
-          });
-        }
-
-        streamRef.current = stream;
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          await videoRef.current.play();
-        }
-        setFacingMode(requestedFacing);
-        setCameraActive(true);
-      } catch (err) {
-        const message =
-          err instanceof DOMException && err.name === 'NotAllowedError'
-            ? '摄像头权限未开启。请在浏览器地址栏允许相机权限，或直接使用「相册选图」识别照片。'
-            : '未检测到可用摄像头，您仍可直接选择本地照片或示例人像体验快速识人。';
-        setCameraError(message);
-      } finally {
-        setCameraStarting(false);
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: 'environment' },
+            width: { ideal: 1280 },
+            height: { ideal: 960 },
+          },
+          audio: false,
+        });
+      } catch {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: false,
+        });
       }
-    },
-    [facingMode, stopCamera]
-  );
 
-  // Stop camera cleanly on unmount
-  useEffect(() => {
-    return () => {
-      stopCamera();
-    };
+      streamRef.current = stream;
+      const track = stream.getVideoTracks()[0] || null;
+      videoTrackRef.current = track;
+
+      // Inspect native system camera hardware zoom capability
+      const caps = track?.getCapabilities
+        ? (track.getCapabilities() as ZoomCapabilities)
+        : null;
+
+      if (caps?.zoom && caps.zoom.max > caps.zoom.min) {
+        const settings = track?.getSettings
+          ? (track.getSettings() as ZoomSettings)
+          : null;
+        const hwMin = Number(caps.zoom.min);
+        const hwMax = Number(caps.zoom.max);
+        const hwStep = Number(caps.zoom.step) || 0.1;
+        const initial =
+          typeof settings?.zoom === 'number'
+            ? Math.max(hwMin, Math.min(hwMax, settings.zoom))
+            : hwMin;
+
+        setHardwareZoomSupported(true);
+        setMinZoom(hwMin);
+        setMaxZoom(hwMax);
+        zoomStepRef.current = hwStep;
+        setZoom(Number(initial.toFixed(2)));
+      } else {
+        // Fallback smooth digital sensor-crop zoom when hardware zoom is unavailable
+        setHardwareZoomSupported(false);
+        setMinZoom(1);
+        setMaxZoom(4);
+        zoomStepRef.current = 0.05;
+        setZoom(1);
+      }
+
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+      }
+      setCameraActive(true);
+    } catch (err) {
+      const message =
+        err instanceof DOMException && err.name === 'NotAllowedError'
+          ? '摄像头权限未开启，请在系统或浏览器中允许访问相机。'
+          : '未检测到可用摄像头，请检查设备相机状态。';
+      setCameraError(message);
+    } finally {
+      setCameraStarting(false);
+    }
   }, [stopCamera]);
 
-  // Re-evaluate captured faces immediately whenever persons library or threshold changes
-  const evaluatedCapturedFaces = useMemo(() => {
+  useEffect(() => {
+    void startRearCamera();
+    return () => {
+      if (zoomBadgeTimerRef.current !== null) {
+        window.clearTimeout(zoomBadgeTimerRef.current);
+      }
+      stopCamera();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Re-evaluate captured faces immediately when library or similarity setting changes
+  const evaluatedFaces = useMemo(() => {
     if (capturedFaces.length === 0) return [];
     return capturedFaces.map((face) => {
       if (persons.length === 0) {
@@ -201,885 +276,392 @@ export const CameraRecognizeView: React.FC<CameraRecognizeViewProps> = ({
 
       const topCandidates = candidates.slice(0, 3);
       const best = topCandidates[0];
-      const matchedPerson = best && best.distance <= threshold ? best : null;
+      const matchedPerson =
+        best && best.similarity >= minSimilarity ? best : null;
+
       return {
         ...face,
         matchedPerson,
         topCandidates,
       };
     });
-  }, [capturedFaces, persons, threshold]);
+  }, [capturedFaces, persons, minSimilarity]);
 
-  // Real-time live camera face tracking loop
-  useEffect(() => {
-    if (
-      !cameraActive ||
-      !liveTracking ||
-      capturedImageUrl !== null ||
-      engineState.status !== 'ready'
-    ) {
-      setLiveFaces([]);
-      if (liveLoopTimerRef.current !== null) {
-        window.clearTimeout(liveLoopTimerRef.current);
-        liveLoopTimerRef.current = null;
-      }
+  const activeFace =
+    evaluatedFaces.find((f) => f.id === selectedFaceId) ??
+    evaluatedFaces[0] ??
+    null;
+
+  /**
+   * Captures current video frame; if using digital zoom fallback (> 1x), crops the zoomed center region.
+   */
+  const buildCaptureSourceFromVideo = (
+    video: HTMLVideoElement
+  ): HTMLVideoElement | HTMLCanvasElement => {
+    if (hardwareZoomSupported || zoomRef.current <= 1.01) {
+      return video;
+    }
+
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    if (vw === 0 || vh === 0) return video;
+
+    const factor = zoomRef.current;
+    const cropW = vw / factor;
+    const cropH = vh / factor;
+    const sx = (vw - cropW) / 2;
+    const sy = (vh - cropH) / 2;
+
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(vw);
+    canvas.height = Math.round(vh);
+    const ctx = canvas.getContext('2d');
+    if (ctx) {
+      ctx.drawImage(video, sx, sy, cropW, cropH, 0, 0, canvas.width, canvas.height);
+    }
+    return canvas;
+  };
+
+  const handleCaptureClick = async () => {
+    if (engineState.status !== 'ready' || isAnalyzing) return;
+    if (!cameraActive || !videoRef.current) {
+      await startRearCamera();
       return;
     }
 
-    let cancelled = false;
+    setShutterFlash(true);
+    window.setTimeout(() => setShutterFlash(false), 140);
 
-    const runStep = async () => {
-      if (cancelled) return;
-      const video = videoRef.current;
-      if (video && video.readyState >= 2 && !liveBusyRef.current) {
-        liveBusyRef.current = true;
-        try {
-          const result = await recognizeFacesInSource(video, persons, threshold, 'fast');
-          if (!cancelled) {
-            setLiveFaces(result.faces);
-            setLiveElapsedMs(result.elapsedMs);
-          }
-        } catch {
-          // Ignore single frame errors during stream transitions
-        } finally {
-          liveBusyRef.current = false;
-        }
-      }
-      if (!cancelled) {
-        liveLoopTimerRef.current = window.setTimeout(runStep, 280);
-      }
-    };
-
-    liveLoopTimerRef.current = window.setTimeout(runStep, 180);
-
-    return () => {
-      cancelled = true;
-      if (liveLoopTimerRef.current !== null) {
-        window.clearTimeout(liveLoopTimerRef.current);
-        liveLoopTimerRef.current = null;
-      }
-    };
-  }, [cameraActive, liveTracking, capturedImageUrl, engineState.status, persons, threshold]);
-
-  const analyzeImageSource = async (
-    source: HTMLImageElement | HTMLVideoElement,
-    sourceType: 'camera' | 'album' | 'sample'
-  ) => {
     setIsAnalyzing(true);
     setAnalysisError(null);
+    setHasAttemptedCapture(true);
     setRegisterName('');
-    setRegisterNote('');
 
     try {
-      const snap = createSnapshotDataUrl(source, 960);
-      setCapturedImageUrl(snap.dataUrl);
-
-      const result = await recognizeFacesInSource(source, persons, threshold, 'accurate');
+      const source = buildCaptureSourceFromVideo(videoRef.current);
+      const result = await recognizeFacesInSource(
+        source,
+        persons,
+        internalCutoff,
+        'accurate'
+      );
       setCapturedFaces(result.faces);
-      setCapturedElapsedMs(result.elapsedMs);
+      setElapsedMs(result.elapsedMs);
       setSelectedFaceId(result.faces[0]?.id ?? null);
-
-      const historyEntry: RecognitionHistoryEntry = {
-        id: `hist-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-        timestamp: Date.now(),
-        snapshotDataUrl: snap.dataUrl,
-        sourceType,
-        elapsedMs: result.elapsedMs,
-        threshold,
-        matches: result.faces.map((f) => ({
-          name: f.matchedPerson?.personName ?? '未匹配人物',
-          matched: Boolean(f.matchedPerson),
-          similarity: f.matchedPerson?.similarity ?? (f.topCandidates[0]?.similarity ?? 0),
-          distance: f.matchedPerson?.distance ?? (f.topCandidates[0]?.distance ?? 1),
-          personId: f.matchedPerson?.personId ?? null,
-        })),
-      };
-      await onRecordHistory(historyEntry);
     } catch (err) {
       setAnalysisError(
-        err instanceof Error ? err.message : '识别该照片时出现异常，请重试'
+        err instanceof Error ? err.message : '识别失败，请调整光线后重试'
       );
     } finally {
       setIsAnalyzing(false);
     }
   };
 
-  const handleCapturePhoto = async () => {
-    const video = videoRef.current;
-    if (!video || !cameraActive || engineState.status !== 'ready') return;
-
-    setShutterFlash(true);
-    window.setTimeout(() => setShutterFlash(false), 160);
-
-    await analyzeImageSource(video, 'camera');
-  };
-
-  const handleAlbumFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    e.target.value = '';
-    if (!file || engineState.status !== 'ready') return;
-
-    try {
-      const dataUrl = await readFileAsDataUrl(file);
-      const img = await loadImageElement(dataUrl);
-      await analyzeImageSource(img, 'album');
-    } catch (err) {
-      setAnalysisError(err instanceof Error ? err.message : '无法读取该照片');
+  // Two-finger pinch-to-zoom handlers
+  const handleTouchStart = (e: React.TouchEvent<HTMLElement>) => {
+    if (!cameraActive || e.touches.length !== 2) return;
+    const dist = getTouchDistance(e.touches[0], e.touches[1]);
+    if (dist > 0) {
+      pinchStateRef.current = {
+        startDist: dist,
+        startZoom: zoomRef.current,
+      };
     }
   };
 
-  const handleTestSamplePhoto = async (imageUrl: string) => {
-    if (engineState.status !== 'ready') return;
-    try {
-      const img = await loadImageElement(imageUrl);
-      await analyzeImageSource(img, 'sample');
-    } catch (err) {
-      setAnalysisError(err instanceof Error ? err.message : '示例照片读取失败');
+  const handleTouchMove = (e: React.TouchEvent<HTMLElement>) => {
+    if (!cameraActive || e.touches.length !== 2 || !pinchStateRef.current) return;
+    const currentDist = getTouchDistance(e.touches[0], e.touches[1]);
+    const ratio = currentDist / pinchStateRef.current.startDist;
+    const nextZoom = pinchStateRef.current.startZoom * ratio;
+    void applyZoomValue(nextZoom);
+  };
+
+  const handleTouchEnd = (e: React.TouchEvent<HTMLElement>) => {
+    if (e.touches.length < 2) {
+      pinchStateRef.current = null;
     }
   };
 
-  const handleResumeLive = () => {
-    setCapturedImageUrl(null);
-    setCapturedFaces([]);
-    setSelectedFaceId(null);
-    setAnalysisError(null);
-    if (!cameraActive) {
-      void startCamera(facingMode);
-    }
+  const handleWheelZoom = (e: React.WheelEvent<HTMLElement>) => {
+    if (!cameraActive) return;
+    const delta = e.deltaY < 0 ? 0.15 : -0.15;
+    void applyZoomValue(zoomRef.current + delta);
   };
 
-  const activeFaces = capturedImageUrl ? evaluatedCapturedFaces : liveFaces;
-  const activeElapsedMs = capturedImageUrl ? capturedElapsedMs : liveElapsedMs;
-  const activeSelectedFace =
-    evaluatedCapturedFaces.find((f) => f.id === selectedFaceId) ??
-    evaluatedCapturedFaces[0] ??
-    null;
-
-  const isFrontMirrored = cameraActive && !capturedImageUrl && facingMode === 'user';
-
-  const handleSubmitQuickRegister = async (e: React.FormEvent) => {
+  const handleQuickSave = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!activeSelectedFace) return;
-    const cleanName = registerName.trim();
-    if (!cleanName) return;
-
+    if (!activeFace || !registerName.trim()) return;
     setRegistering(true);
     try {
       await onQuickRegisterFace(
-        cleanName,
-        registerNote.trim(),
-        activeSelectedFace.descriptor,
-        activeSelectedFace.cropThumbnail
+        registerName.trim(),
+        '',
+        activeFace.descriptor,
+        activeFace.cropThumbnail
       );
       setRegisterName('');
-      setRegisterNote('');
     } finally {
       setRegistering(false);
     }
   };
 
+  const displayZoomRatio = minZoom > 0 ? zoom / minZoom : zoom;
+  const isZoomedIn = displayZoomRatio > 1.04;
+
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-      {/* Left / Main Stage: Precision Camera Viewfinder + Thumb Controls */}
-      <div className="lg:col-span-7 space-y-4">
-        {/* Empty Library Reminder Strip (only when library has 0 people) */}
-        {persons.length === 0 && (
-          <div className="bg-white rounded-2xl border border-slate-200/80 px-4 py-3.5 flex flex-wrap items-center justify-between gap-3">
-            <div className="min-w-0">
-              <p className="text-sm font-medium text-slate-900">
-                当前人物特征库为空
-              </p>
-              <p className="text-xs text-slate-500 mt-0.5">
-                先导入命名照片建库，拍照后即可自动比对并显示姓名
-              </p>
+    <div className="flex flex-col gap-4 h-full">
+      {/* UPPER HALF: Rear Camera Viewfinder with Pinch-to-Zoom & Shutter Button */}
+      <section
+        aria-label="后置摄像头拍照区"
+        onTouchStart={handleTouchStart}
+        onTouchMove={handleTouchMove}
+        onTouchEnd={handleTouchEnd}
+        onTouchCancel={handleTouchEnd}
+        onWheel={handleWheelZoom}
+        className="touch-none relative w-full bg-[#111214] rounded-2xl overflow-hidden border border-neutral-200/80 flex items-center justify-center min-h-[280px] h-[47vh] sm:h-[50vh] max-h-[520px] select-none"
+      >
+        <video
+          ref={videoRef}
+          playsInline
+          muted
+          style={
+            !hardwareZoomSupported && zoom > 1
+              ? { transform: `scale(${zoom})`, transformOrigin: 'center center' }
+              : undefined
+          }
+          className={`w-full h-full object-cover transition-transform duration-75 ${
+            cameraActive ? 'block' : 'hidden'
+          }`}
+        />
+
+        {/* Camera Idle / Permission Fallback */}
+        {!cameraActive && (
+          <div className="px-6 py-8 text-center max-w-sm space-y-4">
+            <div className="mx-auto w-11 h-11 rounded-2xl bg-white/10 flex items-center justify-center text-white/80">
+              <ScanFace className="w-5 h-5" strokeWidth={1.75} />
             </div>
-            <div className="flex items-center gap-2 shrink-0">
-              <button
-                type="button"
-                disabled={engineState.status !== 'ready' || isImporting}
-                onClick={() => void onImportSamples()}
-                className="min-h-[40px] px-3.5 py-2 rounded-xl bg-slate-900 text-white text-xs font-medium hover:bg-slate-800 disabled:opacity-50 whitespace-nowrap"
-              >
-                {isImporting ? '提取中...' : '一键导入 4 位示例人物'}
-              </button>
-              <button
-                type="button"
-                onClick={onGoToImport}
-                className="min-h-[40px] px-3.5 py-2 rounded-xl border border-slate-200 text-slate-700 text-xs font-medium hover:bg-slate-50 whitespace-nowrap"
-              >
-                导入自有照片
-              </button>
-            </div>
+            <p className="text-xs text-neutral-300 leading-relaxed">
+              {cameraStarting
+                ? '正在启动后置摄像头...'
+                : cameraError || '点击下方按钮开启后置摄像头'}
+            </p>
+            <button
+              type="button"
+              disabled={cameraStarting}
+              onClick={() => void startRearCamera()}
+              className="min-h-[42px] px-4 py-2 rounded-xl bg-white text-neutral-950 text-xs font-medium hover:bg-neutral-100 inline-flex items-center gap-1.5 transition-colors disabled:opacity-50"
+            >
+              {cameraStarting ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Video className="w-3.5 h-3.5" />
+              )}
+              <span>开启摄像头</span>
+            </button>
           </div>
         )}
 
-        {/* Optical Viewfinder Container */}
-        <div className="bg-[#0B0E14] rounded-3xl overflow-hidden border border-slate-900/15 shadow-sm">
-          {/* Viewfinder Top Utility Bar */}
-          <div className="px-4 py-3 flex items-center justify-between gap-3 border-b border-white/10">
-            <div className="text-xs text-slate-300 flex items-center gap-2 tabular-nums">
-              <span className="font-medium text-white">
-                {capturedImageUrl
-                  ? '照片识别结果'
-                  : cameraActive
-                    ? facingMode === 'environment'
-                      ? '后置镜头'
-                      : '前置镜头'
-                    : '拍照识人取景器'}
-              </span>
-              {activeElapsedMs !== null && (
-                <>
-                  <span aria-hidden="true" className="text-slate-600">
-                    ·
-                  </span>
-                  <span className="font-mono text-slate-300">{activeElapsedMs} ms</span>
-                </>
-              )}
-            </div>
+        {/* Minimal Floating Zoom Multiplier (Visible while pinching or zoomed in; tap to reset 1x) */}
+        {cameraActive && (zoomBadgeVisible || isZoomedIn) && (
+          <button
+            type="button"
+            onClick={() => void applyZoomValue(minZoom)}
+            aria-label="重置焦距为 1 倍"
+            className="absolute bottom-[86px] left-1/2 -translate-x-1/2 z-20 min-h-[30px] px-2.5 rounded-full bg-black/50 backdrop-blur-xs text-white text-xs font-mono tabular-nums hover:bg-black/70 transition-opacity"
+          >
+            {displayZoomRatio.toFixed(1)}×
+          </button>
+        )}
 
-            <div className="flex items-center gap-2">
-              {cameraActive && !capturedImageUrl && (
-                <button
-                  type="button"
-                  onClick={() => setLiveTracking((v) => !v)}
-                  className={`min-h-[36px] px-3 py-1 rounded-lg text-xs font-medium transition-colors whitespace-nowrap ${
-                    liveTracking
-                      ? 'bg-blue-600 text-white'
-                      : 'bg-white/10 text-slate-300 hover:bg-white/15'
-                  }`}
-                >
-                  {liveTracking ? '实时标名：开' : '实时标名：关'}
-                </button>
-              )}
-
-              {cameraActive && (
-                <button
-                  type="button"
-                  onClick={stopCamera}
-                  aria-label="关闭摄像头"
-                  className="min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg bg-white/10 text-slate-300 hover:bg-white/20 hover:text-white transition-colors"
-                >
-                  <VideoOff className="w-4 h-4" />
-                </button>
-              )}
-            </div>
-          </div>
-
-          {/* Main Lens Canvas Area */}
-          <div className="relative w-full bg-[#0B0E14] min-h-[340px] flex items-center justify-center overflow-hidden">
-            {/* Tightly Fitted Media + Overlay Stage (Zero Letterbox Offset) */}
-            <div
-              className={`relative items-center justify-center max-w-full ${
-                cameraActive || capturedImageUrl ? 'inline-flex' : 'hidden'
-              }`}
-            >
-              {/* Live Video Stream (kept mounted so videoRef is always available) */}
-              <video
-                ref={videoRef}
-                playsInline
-                muted
-                className={`block max-h-[540px] max-w-full w-auto h-auto ${
-                  cameraActive && !capturedImageUrl ? 'block' : 'hidden'
-                } ${isFrontMirrored ? '-scale-x-100' : ''}`}
-              />
-
-              {/* Captured Snapshot Image */}
-              {capturedImageUrl && (
-                <img
-                  src={capturedImageUrl}
-                  alt="已拍摄识别的照片"
-                  referrerPolicy="no-referrer"
-                  className="block max-h-[540px] max-w-full w-auto h-auto"
-                />
-              )}
-
-              {/* Real-Time & Snapshot Face Bounding Box Overlay */}
-              {activeFaces.length > 0 && (
-                <div className="absolute inset-0 pointer-events-none">
-                  {activeFaces.map((face) => {
-                    const matched = Boolean(face.matchedPerson);
-                    const isSelected =
-                      capturedImageUrl && activeSelectedFace?.id === face.id;
-                    const displayX = isFrontMirrored
-                      ? 1 - face.box.x - face.box.width
-                      : face.box.x;
-                    const labelBelow = face.box.y < 0.12;
-
-                    return (
-                      <button
-                        key={face.id}
-                        type="button"
-                        onClick={() =>
-                          capturedImageUrl && setSelectedFaceId(face.id)
-                        }
-                        style={{
-                          left: `${displayX * 100}%`,
-                          top: `${face.box.y * 100}%`,
-                          width: `${face.box.width * 100}%`,
-                          height: `${face.box.height * 100}%`,
-                        }}
-                        className={`absolute rounded-lg transition-all duration-150 ${
-                          capturedImageUrl
-                            ? 'pointer-events-auto cursor-pointer'
-                            : 'pointer-events-none'
-                        } ${
-                          matched
-                            ? isSelected
-                              ? 'ring-2 ring-emerald-400 bg-emerald-500/10'
-                              : 'ring-2 ring-emerald-400/85'
-                            : isSelected
-                              ? 'ring-2 ring-amber-400 bg-amber-500/10'
-                              : 'ring-2 ring-amber-400/80'
-                        }`}
-                      >
-                        {/* High-Contrast Floating Name Plate */}
-                        <div
-                          className={`absolute left-0 ${
-                            labelBelow ? 'top-full mt-1.5' : '-top-8'
-                          } max-w-[220px] px-2.5 py-1 rounded-lg text-xs font-semibold whitespace-nowrap flex items-center gap-1.5 shadow-md ${
-                            matched
-                              ? 'bg-emerald-600 text-white'
-                              : 'bg-slate-900/90 text-amber-200 border border-amber-400/50'
-                          }`}
-                        >
-                          <span className="truncate">
-                            {face.matchedPerson
-                              ? face.matchedPerson.personName
-                              : '未匹配人物'}
-                          </span>
-                          {face.matchedPerson && (
-                            <span className="font-mono text-[11px] opacity-90 tabular-nums">
-                              {face.matchedPerson.similarity}%
-                            </span>
-                          )}
-                        </div>
-                      </button>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-
-            {/* Idle / Permission Fallback State */}
-            {!cameraActive && !capturedImageUrl && (
-              <div className="px-6 py-12 text-center max-w-md mx-auto space-y-5">
-                <div className="mx-auto w-14 h-14 rounded-2xl bg-white/8 border border-white/10 flex items-center justify-center text-blue-400">
-                  <ScanFace className="w-7 h-7" />
-                </div>
-
-                <div className="space-y-1.5">
-                  <h2 className="text-base font-semibold text-white">
-                    {cameraStarting ? '正在启动摄像头...' : '准备就绪，随时拍照识人'}
-                  </h2>
-                  <p className="text-xs text-slate-400 leading-relaxed">
-                    {cameraError ||
-                      '点击下方按钮开启手机/电脑摄像头拍照识别，或直接从相册选取照片进行人物检索。'}
-                  </p>
-                </div>
-
-                <div className="flex flex-wrap items-center justify-center gap-2.5">
-                  <button
-                    type="button"
-                    disabled={cameraStarting || engineState.status !== 'ready'}
-                    onClick={() => void startCamera(facingMode)}
-                    className="min-h-[46px] px-5 py-2.5 rounded-xl bg-blue-600 text-white text-sm font-medium hover:bg-blue-500 active:scale-[0.98] transition-all inline-flex items-center gap-2 disabled:opacity-50 whitespace-nowrap"
-                  >
-                    {cameraStarting ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                    ) : (
-                      <Video className="w-4 h-4" />
-                    )}
-                    <span>开启摄像头</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    disabled={engineState.status !== 'ready'}
-                    onClick={() => albumInputRef.current?.click()}
-                    className="min-h-[46px] px-4 py-2.5 rounded-xl bg-white/10 text-white text-sm font-medium hover:bg-white/15 active:scale-[0.98] transition-all inline-flex items-center gap-2 disabled:opacity-50 whitespace-nowrap"
-                  >
-                    <ImageIcon className="w-4 h-4" />
-                    <span>相册选图识别</span>
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {/* Analyzing Overlay */}
-            {isAnalyzing && (
-              <div className="absolute inset-0 bg-slate-950/60 backdrop-blur-xs flex flex-col items-center justify-center gap-2.5 text-white">
-                <Loader2 className="w-7 h-7 animate-spin text-blue-400" />
-                <span className="text-sm font-medium">正在提取面部特征并检索人物库...</span>
-              </div>
-            )}
-
-            {/* Subtle Shutter Flash */}
-            {shutterFlash && (
-              <div className="absolute inset-0 bg-white/80 pointer-events-none transition-opacity duration-150" />
-            )}
-          </div>
-
-          {/* Bottom Thumb-Zone Camera Action Bar */}
-          <div className="px-5 py-4 bg-[#11151E] border-t border-white/10 flex items-center justify-between gap-4">
-            {/* Left Action: Pick Photo from Album */}
+        {/* Shutter Button Anchored Bottom-Center of Camera Area */}
+        {cameraActive && (
+          <div className="absolute inset-x-0 bottom-4 z-20 flex flex-col items-center pointer-events-none">
             <button
               type="button"
               disabled={engineState.status !== 'ready' || isAnalyzing}
-              onClick={() => albumInputRef.current?.click()}
-              className="min-h-[48px] min-w-[84px] px-3 py-2 rounded-2xl bg-white/10 hover:bg-white/15 active:scale-[0.97] text-white text-xs font-medium flex flex-col items-center justify-center gap-1 transition-all disabled:opacity-45"
+              onClick={() => void handleCaptureClick()}
+              aria-label="拍照并匹配人物"
+              className="pointer-events-auto w-[62px] h-[62px] rounded-full border-[2.5px] border-white/95 p-1 flex items-center justify-center bg-black/20 backdrop-blur-xs active:scale-92 transition-transform disabled:opacity-50"
             >
-              <ImageIcon className="w-4 h-4" />
-              <span>相册选图</span>
-            </button>
-
-            <input
-              ref={albumInputRef}
-              type="file"
-              accept="image/*"
-              onChange={handleAlbumFileChange}
-              className="hidden"
-            />
-
-            {/* Center Primary CTA: Tactile Shutter / Resume Camera */}
-            {capturedImageUrl ? (
-              <button
-                type="button"
-                onClick={handleResumeLive}
-                className="min-h-[54px] px-6 py-3 rounded-full bg-blue-600 hover:bg-blue-500 active:scale-[0.97] text-white text-sm font-semibold flex items-center gap-2 shadow-lg shadow-blue-950/40 transition-all whitespace-nowrap"
-              >
-                <RefreshCw className="w-4 h-4" />
-                <span>继续拍照识别</span>
-              </button>
-            ) : cameraActive ? (
-              <button
-                type="button"
-                disabled={engineState.status !== 'ready' || isAnalyzing}
-                onClick={() => void handleCapturePhoto()}
-                aria-label="拍照并识别人物"
-                className="group relative w-16 h-16 rounded-full border-[3px] border-white/90 p-1 flex items-center justify-center active:scale-95 transition-transform disabled:opacity-50"
-              >
-                <span className="w-full h-full rounded-full bg-white group-hover:bg-blue-50 flex items-center justify-center text-slate-900">
-                  <Camera className="w-6 h-6" />
-                </span>
-              </button>
-            ) : (
-              <button
-                type="button"
-                disabled={cameraStarting || engineState.status !== 'ready'}
-                onClick={() => void startCamera(facingMode)}
-                className="min-h-[54px] px-6 py-3 rounded-full bg-blue-600 hover:bg-blue-500 active:scale-[0.97] text-white text-sm font-semibold flex items-center gap-2 transition-all disabled:opacity-50 whitespace-nowrap"
-              >
-                <Camera className="w-4 h-4" />
-                <span>开启拍照识别</span>
-              </button>
-            )}
-
-            {/* Right Action: Switch Front/Rear Camera */}
-            <button
-              type="button"
-              disabled={cameraStarting || engineState.status !== 'ready'}
-              onClick={() => {
-                const next = facingMode === 'environment' ? 'user' : 'environment';
-                if (cameraActive && !capturedImageUrl) {
-                  void startCamera(next);
-                } else {
-                  setFacingMode(next);
-                }
-              }}
-              className="min-h-[48px] min-w-[84px] px-3 py-2 rounded-2xl bg-white/10 hover:bg-white/15 active:scale-[0.97] text-white text-xs font-medium flex flex-col items-center justify-center gap-1 transition-all disabled:opacity-45"
-            >
-              <FlipHorizontal2 className="w-4 h-4" />
-              <span>{facingMode === 'environment' ? '切前置' : '切后置'}</span>
+              <span className="w-full h-full rounded-full bg-white flex items-center justify-center text-neutral-900">
+                {isAnalyzing ? (
+                  <Loader2 className="w-5 h-5 animate-spin" />
+                ) : (
+                  <Camera className="w-5 h-5" strokeWidth={1.9} />
+                )}
+              </span>
             </button>
           </div>
-        </div>
+        )}
 
-        {/* Quick Test Strip using Sample Portraits (handy on devices without camera) */}
-        {persons.length > 0 && (
-          <div className="bg-white rounded-2xl border border-slate-200/80 p-4 space-y-2.5">
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-xs font-medium text-slate-600">
-                快速照片比对测试（点击任意测试图立即检索）
-              </span>
-            </div>
-            <div className="grid grid-cols-4 gap-2.5">
-              {SAMPLE_PROFILES.map((sample) => (
-                <button
-                  key={sample.filename}
-                  type="button"
-                  disabled={engineState.status !== 'ready' || isAnalyzing}
-                  onClick={() => void handleTestSamplePhoto(sample.imageUrl)}
-                  className="group relative aspect-[4/3] rounded-xl overflow-hidden bg-slate-100 border border-slate-200/80 hover:border-blue-500 transition-colors disabled:opacity-50"
-                >
-                  <img
-                    src={sample.imageUrl}
-                    alt={`测试识别 ${sample.name}`}
-                    referrerPolicy="no-referrer"
-                    className="w-full h-full object-cover object-top group-hover:scale-105 transition-transform duration-200"
-                  />
-                  <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/75 via-black/35 to-transparent px-2 py-1 text-left">
-                    <span className="text-[11px] font-medium text-white">
-                      测试图
-                    </span>
-                  </div>
-                </button>
-              ))}
+        {/* Analyzing Veil */}
+        {isAnalyzing && (
+          <div className="absolute inset-0 z-10 bg-black/45 backdrop-blur-[2px] flex items-center justify-center">
+            <div className="px-4 py-2 rounded-xl bg-black/75 text-white text-xs font-medium flex items-center gap-2">
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              <span>正在识别匹配中...</span>
             </div>
           </div>
         )}
-      </div>
 
-      {/* Right Column: Real-Time Identification Results & Sensitivity Controls */}
-      <div className="lg:col-span-5 space-y-4">
-        {/* Identification Results Card */}
-        <div className="bg-white rounded-2xl border border-slate-200/80 overflow-hidden">
-          <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between gap-3">
-            <div>
-              <h1 className="text-base font-semibold text-slate-900">
-                人物姓名识别结果
-              </h1>
-              <div className="text-xs text-slate-500 mt-0.5 tabular-nums flex items-center gap-2">
-                <span>人物库 {persons.length} 人</span>
-                {activeElapsedMs !== null && (
-                  <>
-                    <span aria-hidden="true">·</span>
-                    <span>耗时 {activeElapsedMs} ms</span>
-                  </>
-                )}
-              </div>
-            </div>
+        {/* Shutter Flash */}
+        {shutterFlash && (
+          <div className="absolute inset-0 z-30 bg-white/80 pointer-events-none" />
+        )}
+      </section>
 
-            {capturedImageUrl && evaluatedCapturedFaces.length > 1 && (
-              <span className="text-xs font-medium text-blue-600 tabular-nums">
-                检测到 {evaluatedCapturedFaces.length} 人
+      {/* Multi-face Selector (Only appears if >= 2 faces captured in one photo) */}
+      {evaluatedFaces.length > 1 && (
+        <div className="flex items-center gap-2 overflow-x-auto pb-0.5">
+          <span className="text-xs text-neutral-500 shrink-0">
+            检测到 {evaluatedFaces.length} 张人脸：
+          </span>
+          {evaluatedFaces.map((face, idx) => {
+            const selected = activeFace?.id === face.id;
+            return (
+              <button
+                key={face.id}
+                type="button"
+                onClick={() => setSelectedFaceId(face.id)}
+                className={`min-h-[36px] px-3 py-1 rounded-xl text-xs font-medium border transition-colors whitespace-nowrap shrink-0 ${
+                  selected
+                    ? 'bg-neutral-900 text-white border-neutral-900'
+                    : 'bg-white text-neutral-700 border-neutral-200 hover:border-neutral-300'
+                }`}
+              >
+                {face.matchedPerson?.personName ?? `人脸 ${idx + 1}`}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      {analysisError && (
+        <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-xl px-3.5 py-2.5">
+          {analysisError}
+        </p>
+      )}
+
+      {/* LOWER HALF: Strict Left / Right Comparison Split */}
+      <section
+        aria-label="抓拍与人物库比对结果"
+        className="grid grid-cols-2 gap-3 sm:gap-5 flex-1 items-start"
+      >
+        {/* LEFT HALF: Captured Face Crop from Camera */}
+        <div className="bg-white rounded-2xl border border-neutral-200/90 p-3 sm:p-4 space-y-2.5">
+          <div className="flex items-baseline justify-between gap-2">
+            <span className="text-xs font-medium text-neutral-500">
+              抓拍人脸
+            </span>
+            {elapsedMs !== null && activeFace && (
+              <span className="text-[11px] font-mono text-neutral-400 tabular-nums">
+                {elapsedMs} ms
               </span>
             )}
           </div>
 
-          <div className="p-5 space-y-5">
-            {analysisError && (
-              <div className="rounded-xl bg-amber-50 border border-amber-200 p-3.5 text-xs text-amber-800 flex items-start gap-2">
-                <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
-                <span>{analysisError}</span>
-              </div>
-            )}
-
-            {/* Case 1: Captured Photo Result */}
-            {capturedImageUrl ? (
-              evaluatedCapturedFaces.length === 0 ? (
-                <div className="py-8 text-center space-y-2">
-                  <p className="text-sm font-semibold text-slate-800">
-                    照片中未检测到清晰人脸
-                  </p>
-                  <p className="text-xs text-slate-500">
-                    请确保人物面部光线充足、正面朝向镜头且未被遮挡后重新拍摄。
-                  </p>
-                </div>
-              ) : (
-                <div className="space-y-5">
-                  {/* Multi-face selector strip if group photo */}
-                  {evaluatedCapturedFaces.length > 1 && (
-                    <div className="flex items-center gap-2 overflow-x-auto pb-1">
-                      {evaluatedCapturedFaces.map((face, idx) => {
-                        const isSel = activeSelectedFace?.id === face.id;
-                        return (
-                          <button
-                            key={face.id}
-                            type="button"
-                            onClick={() => setSelectedFaceId(face.id)}
-                            className={`min-h-[44px] px-2.5 py-1.5 rounded-xl border flex items-center gap-2 shrink-0 transition-colors ${
-                              isSel
-                                ? 'border-blue-600 bg-blue-50/70'
-                                : 'border-slate-200 hover:bg-slate-50'
-                            }`}
-                          >
-                            {face.cropThumbnail && (
-                              <img
-                                src={face.cropThumbnail}
-                                alt={`人脸 ${idx + 1}`}
-                                referrerPolicy="no-referrer"
-                                className="w-7 h-7 rounded-lg object-cover"
-                              />
-                            )}
-                            <span className="text-xs font-medium text-slate-900 whitespace-nowrap">
-                              {face.matchedPerson?.personName ?? `人物 ${idx + 1}`}
-                            </span>
-                          </button>
-                        );
-                      })}
-                    </div>
-                  )}
-
-                  {/* Active Face Match Detail */}
-                  {activeSelectedFace && (
-                    <div className="space-y-4">
-                      {activeSelectedFace.matchedPerson ? (
-                        <div className="space-y-4">
-                          <div className="flex items-start justify-between gap-3">
-                            <div>
-                              <div className="inline-flex items-center gap-1.5 text-xs font-medium text-emerald-700">
-                                <CheckCircle2 className="w-4 h-4" />
-                                <span>已匹配人物库档案</span>
-                              </div>
-                              <div className="text-3xl font-bold tracking-tight text-slate-900 mt-1">
-                                {activeSelectedFace.matchedPerson.personName}
-                              </div>
-                              {activeSelectedFace.matchedPerson.personNote && (
-                                <p className="text-sm text-slate-500 mt-0.5">
-                                  {activeSelectedFace.matchedPerson.personNote}
-                                </p>
-                              )}
-                            </div>
-
-                            <div className="text-right tabular-nums shrink-0">
-                              <div className="text-2xl font-bold text-emerald-700 font-mono">
-                                {activeSelectedFace.matchedPerson.similarity}%
-                              </div>
-                              <div className="text-[11px] text-slate-500 font-mono">
-                                距离 {activeSelectedFace.matchedPerson.distance.toFixed(3)}
-                              </div>
-                            </div>
-                          </div>
-
-                          {/* Side-by-side Face Comparison */}
-                          <div className="grid grid-cols-2 gap-3 pt-1">
-                            <div className="space-y-1.5">
-                              <div className="aspect-square rounded-xl overflow-hidden bg-slate-100 border border-slate-200/80">
-                                {activeSelectedFace.cropThumbnail && (
-                                  <img
-                                    src={activeSelectedFace.cropThumbnail}
-                                    alt="本次拍摄人脸"
-                                    referrerPolicy="no-referrer"
-                                    className="w-full h-full object-cover"
-                                  />
-                                )}
-                              </div>
-                              <p className="text-xs text-slate-500 text-center">本次拍摄</p>
-                            </div>
-
-                            <div className="space-y-1.5">
-                              <div className="aspect-square rounded-xl overflow-hidden bg-slate-100 border border-slate-200/80">
-                                {activeSelectedFace.matchedPerson.referenceThumbnail && (
-                                  <img
-                                    src={activeSelectedFace.matchedPerson.referenceThumbnail}
-                                    alt={activeSelectedFace.matchedPerson.personName}
-                                    referrerPolicy="no-referrer"
-                                    className="w-full h-full object-cover"
-                                  />
-                                )}
-                              </div>
-                              <p className="text-xs text-slate-500 text-center">
-                                库内底图 · {activeSelectedFace.matchedPerson.personName}
-                              </p>
-                            </div>
-                          </div>
-                        </div>
-                      ) : (
-                        <div className="space-y-4">
-                          <div className="flex items-center gap-3.5">
-                            {activeSelectedFace.cropThumbnail && (
-                              <img
-                                src={activeSelectedFace.cropThumbnail}
-                                alt="未匹配人脸"
-                                referrerPolicy="no-referrer"
-                                className="w-16 h-16 rounded-2xl object-cover border border-slate-200"
-                              />
-                            )}
-                            <div>
-                              <div className="text-base font-semibold text-slate-900">
-                                未匹配到已建档人物
-                              </div>
-                              <p className="text-xs text-slate-500 mt-0.5">
-                                {persons.length === 0
-                                  ? '人物库为空，可直接将该人脸录入建档'
-                                  : `当前阈值下无高于标准的匹配（最接近距离 ${
-                                      activeSelectedFace.topCandidates[0]?.distance.toFixed(3) ?? '-'
-                                    }）`}
-                              </p>
-                            </div>
-                          </div>
-
-                          {/* One-Tap Quick Register Form */}
-                          <form
-                            onSubmit={handleSubmitQuickRegister}
-                            className="p-4 rounded-2xl bg-slate-50 border border-slate-200/80 space-y-3"
-                          >
-                            <div className="text-xs font-semibold text-slate-800 flex items-center gap-1.5">
-                              <UserPlus className="w-4 h-4 text-blue-600" />
-                              <span>直接将此人脸保存为新人物</span>
-                            </div>
-                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                              <input
-                                type="text"
-                                required
-                                value={registerName}
-                                onChange={(e) => setRegisterName(e.target.value)}
-                                placeholder="输入人物姓名"
-                                className="min-h-[42px] px-3 rounded-xl bg-white border border-slate-200 text-sm text-slate-900 focus:outline-none focus:border-blue-500"
-                              />
-                              <input
-                                type="text"
-                                value={registerNote}
-                                onChange={(e) => setRegisterNote(e.target.value)}
-                                placeholder="备注（选填）"
-                                className="min-h-[42px] px-3 rounded-xl bg-white border border-slate-200 text-sm text-slate-900 focus:outline-none focus:border-blue-500"
-                              />
-                            </div>
-                            <button
-                              type="submit"
-                              disabled={registering || !registerName.trim()}
-                              className="w-full min-h-[42px] px-4 py-2 rounded-xl bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:opacity-50"
-                            >
-                              {registering ? '保存中...' : '录入特征并立即匹配'}
-                            </button>
-                          </form>
-                        </div>
-                      )}
-
-                      {/* Top 3 Closest Candidates */}
-                      {activeSelectedFace.topCandidates.length > 0 && (
-                        <div className="pt-4 border-t border-slate-100 space-y-2.5">
-                          <div className="text-xs font-medium text-slate-500">
-                            特征向量最接近候选（前 {activeSelectedFace.topCandidates.length} 位）
-                          </div>
-                          <div className="space-y-2">
-                            {activeSelectedFace.topCandidates.map((cand) => {
-                              const isMatched = cand.distance <= threshold;
-                              return (
-                                <div
-                                  key={cand.personId}
-                                  className="flex items-center gap-3 py-1"
-                                >
-                                  <img
-                                    src={cand.referenceThumbnail}
-                                    alt={cand.personName}
-                                    referrerPolicy="no-referrer"
-                                    className="w-9 h-9 rounded-lg object-cover bg-slate-100 shrink-0"
-                                  />
-                                  <div className="min-w-0 flex-1">
-                                    <div className="flex items-center justify-between gap-2 text-xs">
-                                      <span className="font-medium text-slate-900 truncate">
-                                        {cand.personName}
-                                      </span>
-                                      <span
-                                        className={`font-mono tabular-nums ${
-                                          isMatched ? 'text-emerald-700 font-semibold' : 'text-slate-500'
-                                        }`}
-                                      >
-                                        {cand.similarity}% · d={cand.distance.toFixed(3)}
-                                      </span>
-                                    </div>
-                                    <div className="h-1.5 bg-slate-100 rounded-full overflow-hidden mt-1.5">
-                                      <div
-                                        className={`h-full rounded-full ${
-                                          isMatched ? 'bg-emerald-500' : 'bg-slate-300'
-                                        }`}
-                                        style={{ width: `${cand.similarity}%` }}
-                                      />
-                                    </div>
-                                  </div>
-                                </div>
-                              );
-                            })}
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </div>
-              )
-            ) : cameraActive && liveFaces.length > 0 ? (
-              /* Case 2: Live Tracking Preview List */
-              <div className="space-y-3">
-                <div className="text-xs text-slate-500">
-                  正在实时取景追踪，按下快门可锁定高清帧并保存识别记录
-                </div>
-                {liveFaces.map((face, idx) => (
-                  <div
-                    key={face.id}
-                    className="p-3.5 rounded-xl bg-slate-50 border border-slate-200/80 flex items-center justify-between gap-3"
-                  >
-                    <div className="flex items-center gap-3 min-w-0">
-                      <div
-                        className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${
-                          face.matchedPerson
-                            ? 'bg-emerald-100 text-emerald-700'
-                            : 'bg-slate-200 text-slate-600'
-                        }`}
-                      >
-                        <UserCheck className="w-5 h-5" />
-                      </div>
-                      <div className="min-w-0">
-                        <div className="text-base font-semibold text-slate-900 truncate">
-                          {face.matchedPerson
-                            ? face.matchedPerson.personName
-                            : `未匹配人物 #${idx + 1}`}
-                        </div>
-                        <div className="text-xs text-slate-500 truncate">
-                          {face.matchedPerson?.personNote || '实时特征追踪中'}
-                        </div>
-                      </div>
-                    </div>
-                    {face.matchedPerson && (
-                      <span className="font-mono text-sm font-semibold text-emerald-700 tabular-nums shrink-0">
-                        {face.matchedPerson.similarity}%
-                      </span>
-                    )}
-                  </div>
-                ))}
-              </div>
+          <div className="aspect-square w-full rounded-xl overflow-hidden bg-[#F4F4F2] border border-neutral-100 flex items-center justify-center">
+            {activeFace?.cropThumbnail ? (
+              <img
+                src={activeFace.cropThumbnail}
+                alt="摄像区抓拍的人脸"
+                referrerPolicy="no-referrer"
+                className="w-full h-full object-cover"
+              />
             ) : (
-              /* Case 3: Waiting for capture */
-              <div className="py-10 text-center space-y-2.5">
-                <div className="mx-auto w-11 h-11 rounded-2xl bg-slate-100 flex items-center justify-center text-slate-400">
-                  <Users className="w-5 h-5" />
-                </div>
-                <p className="text-sm font-medium text-slate-800">
-                  等待拍摄或选择人物照片
-                </p>
-                <p className="text-xs text-slate-500 max-w-xs mx-auto leading-relaxed">
-                  拍摄单人或多人合照后，此处将实时显示每位人物的姓名、匹配置信度及底图对照。
-                </p>
-              </div>
+              <span className="text-xs text-neutral-400 px-3 text-center leading-relaxed">
+                {hasAttemptedCapture && !isAnalyzing
+                  ? '未检测到清晰人脸'
+                  : '等待拍照抓拍'}
+              </span>
+            )}
+          </div>
+
+          <div className="min-h-[24px] flex items-center justify-between text-xs text-neutral-500">
+            <span className="truncate">
+              {activeFace
+                ? `画面清晰度 ${Math.round(activeFace.detectionScore * 100)}%`
+                : '双指开合可调焦'}
+            </span>
+          </div>
+        </div>
+
+        {/* RIGHT HALF: Matched Person Portrait & Name from Library */}
+        <div className="bg-white rounded-2xl border border-neutral-200/90 p-3 sm:p-4 space-y-2.5">
+          <div className="flex items-baseline justify-between gap-2">
+            <span className="text-xs font-medium text-neutral-500">
+              人物库匹配
+            </span>
+            {activeFace?.matchedPerson && (
+              <span className="text-[11px] font-mono font-medium text-emerald-700 tabular-nums">
+                相似度 {activeFace.matchedPerson.similarity}%
+              </span>
+            )}
+          </div>
+
+          <div className="aspect-square w-full rounded-xl overflow-hidden bg-[#F4F4F2] border border-neutral-100 flex items-center justify-center">
+            {activeFace?.matchedPerson?.referenceThumbnail ? (
+              <img
+                src={activeFace.matchedPerson.referenceThumbnail}
+                alt={activeFace.matchedPerson.personName}
+                referrerPolicy="no-referrer"
+                className="w-full h-full object-cover"
+              />
+            ) : (
+              <span className="text-xs text-neutral-400 px-3 text-center leading-relaxed">
+                {activeFace
+                  ? persons.length === 0
+                    ? '暂无库内人物'
+                    : '未匹配到库内人物'
+                  : '等待比对结果'}
+              </span>
+            )}
+          </div>
+
+          <div className="min-h-[24px] flex items-baseline justify-between gap-2">
+            {activeFace?.matchedPerson ? (
+              <span className="text-base sm:text-lg font-semibold tracking-tight text-neutral-950 truncate">
+                {activeFace.matchedPerson.personName}
+              </span>
+            ) : activeFace ? (
+              <span className="text-xs text-neutral-500 truncate">
+                {activeFace.topCandidates[0]
+                  ? `最接近 ${activeFace.topCandidates[0].personName}（${activeFace.topCandidates[0].similarity}%）`
+                  : '暂无匹配档案'}
+              </span>
+            ) : (
+              <span className="text-xs text-neutral-400 truncate">
+                匹配后显示姓名
+              </span>
             )}
           </div>
         </div>
+      </section>
 
-        {/* Matching Sensitivity Selector */}
-        <div className="bg-white rounded-2xl border border-slate-200/80 p-5 space-y-3">
-          <div className="flex items-center justify-between gap-2">
-            <span className="text-sm font-semibold text-slate-900">
-              比对严格度阈值
-            </span>
-            <span className="text-xs font-mono text-slate-500 tabular-nums">
-              欧氏距离 ≤ {threshold.toFixed(2)}
-            </span>
-          </div>
-
-          <div className="grid grid-cols-3 gap-1.5 p-1 bg-slate-100 rounded-xl">
-            {THRESHOLD_PRESETS.map((preset) => {
-              const active = Math.abs(threshold - preset.value) < 0.01;
-              return (
-                <button
-                  key={preset.label}
-                  type="button"
-                  onClick={() => onChangeThreshold(preset.value)}
-                  className={`min-h-[42px] px-2 py-1.5 rounded-lg text-xs font-medium transition-colors flex flex-col items-center justify-center ${
-                    active
-                      ? 'bg-white text-slate-900 shadow-xs'
-                      : 'text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  <span>{preset.label}</span>
-                  <span className="text-[10px] text-slate-400 font-normal">
-                    {preset.desc}
-                  </span>
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      </div>
+      {/* Inline Quick Save for Unmatched Face */}
+      {activeFace && !activeFace.matchedPerson && (
+        <form
+          onSubmit={handleQuickSave}
+          className="bg-white rounded-2xl border border-neutral-200/90 p-3.5 flex items-center gap-2.5"
+        >
+          <UserPlus className="w-4 h-4 text-neutral-400 shrink-0" />
+          <input
+            type="text"
+            value={registerName}
+            onChange={(e) => setRegisterName(e.target.value)}
+            placeholder="未在库中匹配，输入姓名可直接录入..."
+            className="flex-1 min-w-0 min-h-[38px] text-sm text-neutral-900 placeholder:text-neutral-400 bg-transparent focus:outline-none"
+          />
+          <button
+            type="submit"
+            disabled={registering || !registerName.trim()}
+            className="min-h-[38px] px-3.5 rounded-xl bg-neutral-900 text-white text-xs font-medium hover:bg-neutral-800 disabled:opacity-40 whitespace-nowrap shrink-0"
+          >
+            {registering ? '保存中' : '存入库'}
+          </button>
+        </form>
+      )}
     </div>
   );
 };

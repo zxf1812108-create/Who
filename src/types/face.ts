@@ -16,6 +16,8 @@ export interface PersonRecord {
   name: string;
   note: string;
   samples: FaceSample[];
+  /** Saved manual drag-and-drop sort index (undefined = default name sort) */
+  sortOrder?: number;
   createdAt: number;
   updatedAt: number;
 }
@@ -59,23 +61,6 @@ export interface RecognitionResult {
   imageHeight: number;
 }
 
-export interface RecognitionHistoryEntry {
-  id: string;
-  timestamp: number;
-  /** Compressed snapshot preview */
-  snapshotDataUrl: string;
-  sourceType: 'camera' | 'album' | 'sample';
-  elapsedMs: number;
-  threshold: number;
-  matches: Array<{
-    name: string;
-    matched: boolean;
-    similarity: number;
-    distance: number;
-    personId: string | null;
-  }>;
-}
-
 export interface ImportQueueItem {
   id: string;
   filename: string;
@@ -88,7 +73,7 @@ export interface ImportQueueItem {
   mergedIntoExisting?: boolean;
 }
 
-export type AppTab = 'camera' | 'import' | 'library' | 'history';
+export type AppTab = 'camera' | 'album' | 'settings';
 
 export interface EngineState {
   status: 'idle' | 'loading' | 'ready' | 'error';

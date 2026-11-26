@@ -12,14 +12,14 @@
   }
 
   body {
-    background-color: #F6F7F9;
-    color: #0F172A;
+    background-color: #F8F8F7;
+    color: #141413;
     overscroll-behavior-y: none;
   }
 }
 
 .pb-safe {
-  padding-bottom: max(0.5rem, env(safe-area-inset-bottom));
+  padding-bottom: max(0.375rem, env(safe-area-inset-bottom));
 }
 
 .tabular-nums {

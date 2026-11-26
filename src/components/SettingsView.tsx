@@ -1,0 +1,397 @@
+import React, { useEffect, useRef, useState } from 'react';
+import {
+  AlertCircle,
+  CheckCircle2,
+  Download,
+  FolderOpen,
+  ImagePlus,
+  Loader2,
+  Minus,
+  Plus,
+  Upload,
+} from 'lucide-react';
+import type { EngineState, ImportQueueItem } from '../types/face';
+
+interface SettingsViewProps {
+  engineState: EngineState;
+  personCount: number;
+  totalSampleCount: number;
+  queue: ImportQueueItem[];
+  isImporting: boolean;
+  mergeIndexedSuffixes: boolean;
+  minSimilarity: number;
+  onToggleMergeSuffixes: (val: boolean) => void;
+  onImportFiles: (files: File[]) => Promise<void>;
+  onClearQueue: () => void;
+  onChangeMinSimilarity: (val: number) => void;
+  onExportBackup: () => void;
+  onImportBackup: (file: File) => Promise<{ ok: boolean; message: string }>;
+}
+
+const SIMILARITY_PRESETS = [
+  { label: '宽松', value: 50, desc: '更容易认出' },
+  { label: '标准', value: 60, desc: '推荐设置' },
+  { label: '严格', value: 70, desc: '防认错优先' },
+] as const;
+
+export const SettingsView: React.FC<SettingsViewProps> = ({
+  engineState,
+  personCount,
+  totalSampleCount,
+  queue,
+  isImporting,
+  mergeIndexedSuffixes,
+  minSimilarity,
+  onToggleMergeSuffixes,
+  onImportFiles,
+  onClearQueue,
+  onChangeMinSimilarity,
+  onExportBackup,
+  onImportBackup,
+}) => {
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
+  const backupInputRef = useRef<HTMLInputElement>(null);
+
+  const [backupNotice, setBackupNotice] = useState<{
+    type: 'ok' | 'err';
+    text: string;
+  } | null>(null);
+
+  useEffect(() => {
+    const input = folderInputRef.current;
+    if (input) {
+      input.setAttribute('webkitdirectory', '');
+      input.setAttribute('directory', '');
+    }
+  }, []);
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const selected = Array.from(e.target.files || []).filter(
+      (f) =>
+        f.type.startsWith('image/') || /\.(jpe?g|png|webp|bmp|gif)$/i.test(f.name)
+    );
+    e.target.value = '';
+    if (selected.length > 0) {
+      void onImportFiles(selected);
+    }
+  };
+
+  const handleBackupFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    const result = await onImportBackup(file);
+    setBackupNotice({
+      type: result.ok ? 'ok' : 'err',
+      text: result.message,
+    });
+    window.setTimeout(() => setBackupNotice(null), 3500);
+  };
+
+  const isDisabled = engineState.status !== 'ready' || isImporting;
+  const successCount = queue.filter((q) => q.status === 'success').length;
+  const failedCount = queue.filter(
+    (q) => q.status === 'no-face' || q.status === 'error'
+  ).length;
+  const processedCount = successCount + failedCount;
+  const progressPct =
+    queue.length > 0 ? Math.round((processedCount / queue.length) * 100) : 0;
+
+  return (
+    <div className="space-y-5">
+      {/* UPPER SECTION: Batch Import Photos */}
+      <section
+        aria-label="导入照片"
+        className="bg-white rounded-2xl border border-neutral-200/90 p-5 space-y-4"
+      >
+        <div className="flex items-baseline justify-between gap-3">
+          <div>
+            <h1 className="text-base font-semibold text-neutral-950">
+              导入照片
+            </h1>
+            <p className="text-xs text-neutral-500 mt-0.5">
+              以照片文件名作为人物姓名，自动提取面部特征
+            </p>
+          </div>
+          <span className="text-xs text-neutral-400 tabular-nums shrink-0">
+            库内 {personCount} 人 · {totalSampleCount} 张
+          </span>
+        </div>
+
+        {/* Primary Import Buttons */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+          <button
+            type="button"
+            disabled={isDisabled}
+            onClick={() => fileInputRef.current?.click()}
+            className="min-h-[48px] px-4 py-3 rounded-xl bg-neutral-950 text-white text-sm font-medium hover:bg-neutral-800 active:scale-[0.98] transition-all flex items-center justify-center gap-2 disabled:opacity-45"
+          >
+            <ImagePlus className="w-4 h-4" strokeWidth={1.8} />
+            <span>批量导入照片</span>
+          </button>
+
+          <button
+            type="button"
+            disabled={isDisabled}
+            onClick={() => folderInputRef.current?.click()}
+            className="min-h-[48px] px-4 py-3 rounded-xl bg-[#F4F4F2] text-neutral-900 text-sm font-medium hover:bg-neutral-200/75 active:scale-[0.98] transition-all flex items-center justify-center gap-2 disabled:opacity-45"
+          >
+            <FolderOpen className="w-4 h-4" strokeWidth={1.8} />
+            <span>导入整个文件夹</span>
+          </button>
+        </div>
+
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/*"
+          multiple
+          onChange={handleFileChange}
+          className="hidden"
+        />
+        <input
+          ref={folderInputRef}
+          type="file"
+          accept="image/*"
+          multiple
+          onChange={handleFileChange}
+          className="hidden"
+        />
+
+        {/* Merge Same-Person Suffix Option */}
+        <label className="flex items-start gap-2.5 cursor-pointer select-none pt-1">
+          <input
+            type="checkbox"
+            checked={mergeIndexedSuffixes}
+            onChange={(e) => onToggleMergeSuffixes(e.target.checked)}
+            className="mt-0.5 h-4 w-4 rounded border-neutral-300 accent-neutral-900"
+          />
+          <span className="text-xs text-neutral-600 leading-relaxed">
+            自动合并同名序号照片（如{' '}
+            <span className="font-mono text-neutral-800">张三_1.jpg</span> 与{' '}
+            <span className="font-mono text-neutral-800">张三_2.jpg</span>{' '}
+            归为同一人）
+          </span>
+        </label>
+
+        {/* Live Import Queue */}
+        {queue.length > 0 && (
+          <div className="pt-3 border-t border-neutral-100 space-y-2.5">
+            <div className="flex items-center justify-between gap-2 text-xs">
+              <div className="text-neutral-600 tabular-nums flex items-center gap-1.5">
+                <span>
+                  处理进度 {processedCount}/{queue.length}
+                </span>
+                <span aria-hidden="true">·</span>
+                <span className="text-emerald-700">成功 {successCount}</span>
+                {failedCount > 0 && (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <span className="text-amber-700">未识别 {failedCount}</span>
+                  </>
+                )}
+              </div>
+              {!isImporting && (
+                <button
+                  type="button"
+                  onClick={onClearQueue}
+                  className="text-neutral-400 hover:text-neutral-800"
+                >
+                  清除记录
+                </button>
+              )}
+            </div>
+
+            <div className="h-1 bg-neutral-100 rounded-full overflow-hidden">
+              <div
+                className="h-full bg-neutral-900 transition-all duration-200"
+                style={{ width: `${progressPct}%` }}
+              />
+            </div>
+
+            <ul className="divide-y divide-neutral-100 max-h-56 overflow-y-auto">
+              {queue.map((item) => (
+                <li
+                  key={item.id}
+                  className="py-2 flex items-center gap-3 text-xs"
+                >
+                  <div className="w-9 h-9 rounded-lg bg-[#F4F4F2] overflow-hidden shrink-0 flex items-center justify-center">
+                    {item.thumbnail ? (
+                      <img
+                        src={item.thumbnail}
+                        alt={item.parsedName}
+                        referrerPolicy="no-referrer"
+                        className="w-full h-full object-cover"
+                      />
+                    ) : item.status === 'processing' ? (
+                      <Loader2 className="w-3.5 h-3.5 text-neutral-600 animate-spin" />
+                    ) : (
+                      <AlertCircle className="w-3.5 h-3.5 text-neutral-400" />
+                    )}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="font-medium text-neutral-900 truncate">
+                      {item.parsedName}
+                    </div>
+                    <div className="text-[11px] text-neutral-400 truncate">
+                      {item.status === 'processing'
+                        ? '提取面部特征中...'
+                        : item.status === 'success'
+                          ? item.mergedIntoExisting
+                            ? '已追加至已有档案'
+                            : '已建立新档案'
+                          : item.status === 'pending'
+                            ? '排队等待'
+                            : item.message || '未检测到人脸'}
+                    </div>
+                  </div>
+                  <div className="shrink-0">
+                    {item.status === 'success' && (
+                      <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                    )}
+                    {item.status === 'processing' && (
+                      <Loader2 className="w-4 h-4 text-neutral-500 animate-spin" />
+                    )}
+                    {(item.status === 'no-face' || item.status === 'error') && (
+                      <AlertCircle className="w-4 h-4 text-amber-500" />
+                    )}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {/* Quiet Backup Utilities */}
+        <div className="pt-3 border-t border-neutral-100 flex items-center justify-end gap-4 text-xs">
+          <button
+            type="button"
+            disabled={personCount === 0}
+            onClick={onExportBackup}
+            className="min-h-[36px] text-neutral-600 hover:text-neutral-950 inline-flex items-center gap-1 disabled:opacity-35"
+          >
+            <Download className="w-3.5 h-3.5" />
+            <span>导出备份</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => backupInputRef.current?.click()}
+            className="min-h-[36px] text-neutral-600 hover:text-neutral-950 inline-flex items-center gap-1"
+          >
+            <Upload className="w-3.5 h-3.5" />
+            <span>恢复备份</span>
+          </button>
+          <input
+            ref={backupInputRef}
+            type="file"
+            accept="application/json,.json"
+            onChange={handleBackupFile}
+            className="hidden"
+          />
+        </div>
+
+        {backupNotice && (
+          <div
+            className={`text-xs px-3 py-2 rounded-xl border ${
+              backupNotice.type === 'ok'
+                ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                : 'bg-amber-50 border-amber-200 text-amber-800'
+            }`}
+          >
+            {backupNotice.text}
+          </div>
+        )}
+      </section>
+
+      {/* LOWER SECTION: Simplified Similarity Matching Requirement */}
+      <section
+        aria-label="匹配相似度设置"
+        className="bg-white rounded-2xl border border-neutral-200/90 p-5 space-y-4"
+      >
+        <div className="flex items-baseline justify-between gap-2">
+          <div>
+            <h2 className="text-base font-semibold text-neutral-950">
+              匹配相似度
+            </h2>
+            <p className="text-xs text-neutral-500 mt-0.5">
+              达到该相似度即显示人物姓名，数值越大越严格
+            </p>
+          </div>
+          <span className="text-base font-semibold font-mono text-neutral-950 tabular-nums shrink-0">
+            ≥ {minSimilarity}%
+          </span>
+        </div>
+
+        {/* 3 Preset Tiers */}
+        <div className="grid grid-cols-3 gap-1.5 p-1 bg-[#F4F4F2] rounded-xl">
+          {SIMILARITY_PRESETS.map((preset) => {
+            const active = minSimilarity === preset.value;
+            return (
+              <button
+                key={preset.label}
+                type="button"
+                onClick={() => onChangeMinSimilarity(preset.value)}
+                className={`min-h-[46px] px-2 py-1.5 rounded-lg text-xs font-medium transition-colors flex flex-col items-center justify-center ${
+                  active
+                    ? 'bg-white text-neutral-950 shadow-xs'
+                    : 'text-neutral-500 hover:text-neutral-900'
+                }`}
+              >
+                <span>
+                  {preset.label} {preset.value}%
+                </span>
+                <span className="text-[10px] text-neutral-400 font-normal mt-0.5">
+                  {preset.desc}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+
+        {/* Precision Slider + +/- 1% Stepper + Exact Input */}
+        <div className="space-y-3 pt-1">
+          <div className="flex items-center gap-2.5">
+            <button
+              type="button"
+              aria-label="降低 1%"
+              disabled={minSimilarity <= 40}
+              onClick={() => onChangeMinSimilarity(minSimilarity - 1)}
+              className="min-h-[44px] min-w-[44px] rounded-xl border border-neutral-200 bg-[#F8F8F7] hover:bg-neutral-100 active:scale-95 flex items-center justify-center text-neutral-800 disabled:opacity-35 transition-all shrink-0"
+            >
+              <Minus className="w-4 h-4" />
+            </button>
+
+            <div className="flex-1 px-1">
+              <input
+                type="range"
+                aria-label="精确调节最低匹配相似度"
+                min={40}
+                max={85}
+                step={1}
+                value={minSimilarity}
+                onChange={(e) => onChangeMinSimilarity(Number(e.target.value))}
+                className="w-full h-2 accent-neutral-950 cursor-pointer"
+              />
+              <div className="flex items-center justify-between text-[11px] text-neutral-400 font-mono tabular-nums mt-1.5">
+                <span>40% 宽松</span>
+                <span>60% 标准</span>
+                <span>85% 严格</span>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              aria-label="提高 1%"
+              disabled={minSimilarity >= 85}
+              onClick={() => onChangeMinSimilarity(minSimilarity + 1)}
+              className="min-h-[44px] min-w-[44px] rounded-xl border border-neutral-200 bg-[#F8F8F7] hover:bg-neutral-100 active:scale-95 flex items-center justify-center text-neutral-800 disabled:opacity-35 transition-all shrink-0"
+            >
+              <Plus className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+};

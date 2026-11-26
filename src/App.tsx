@@ -1,11 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  Camera,
-  Clock,
-  FolderPlus,
-  Loader2,
-  Users,
   AlertCircle,
+  Camera,
+  Images,
+  Loader2,
+  SlidersHorizontal,
 } from 'lucide-react';
 import type {
   AppTab,
@@ -13,7 +12,6 @@ import type {
   FaceSample,
   ImportQueueItem,
   PersonRecord,
-  RecognitionHistoryEntry,
 } from './types/face';
 import {
   extractPrimaryFaceFromImage,
@@ -23,49 +21,63 @@ import {
   readFileAsDataUrl,
 } from './services/faceEngine';
 import {
-  addHistoryEntry,
-  clearAllHistory,
-  deleteHistoryEntry,
   deletePersonById,
-  getAllHistory,
   getAllPersons,
   parseBackupJson,
   putPerson,
+  putPersonsBatch,
   serializeBackup,
+  sortPersonsList,
 } from './services/faceDb';
-import { SAMPLE_PROFILES } from './data/sampleProfiles';
 import { CameraRecognizeView } from './components/CameraRecognizeView';
-import { BatchImportView } from './components/BatchImportView';
-import { PeopleLibraryView } from './components/PeopleLibraryView';
-import { HistoryView } from './components/HistoryView';
+import { AlbumView } from './components/AlbumView';
+import { SettingsView } from './components/SettingsView';
 
-const NAV_ITEMS: Array<{
+const BOTTOM_TABS: Array<{
   id: AppTab;
   label: string;
-  mobileLabel: string;
-  icon: React.ComponentType<{ className?: string }>;
+  icon: React.ComponentType<{ className?: string; strokeWidth?: number }>;
 }> = [
-  { id: 'camera', label: '拍照识别', mobileLabel: '拍照识人', icon: Camera },
-  { id: 'import', label: '批量导入', mobileLabel: '批量导入', icon: FolderPlus },
-  { id: 'library', label: '人物库', mobileLabel: '人物库', icon: Users },
-  { id: 'history', label: '识别记录', mobileLabel: '记录', icon: Clock },
+  { id: 'camera', label: '拍照', icon: Camera },
+  { id: 'album', label: '相册', icon: Images },
+  { id: 'settings', label: '设置', icon: SlidersHorizontal },
 ];
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<AppTab>('camera');
   const [engineState, setEngineState] = useState<EngineState>({
     status: 'loading',
-    progressText: '正在初始化本地人脸特征模型...',
+    progressText: '正在初始化本地人脸识别模型...',
   });
 
   const [persons, setPersons] = useState<PersonRecord[]>([]);
-  const [history, setHistory] = useState<RecognitionHistoryEntry[]>([]);
-  const [threshold, setThreshold] = useState<number>(0.52);
+  const [minSimilarity, setMinSimilarity] = useState<number>(() => {
+    try {
+      const saved = Math.round(
+        Number(localStorage.getItem('face_roster_min_similarity'))
+      );
+      if (Number.isFinite(saved) && saved >= 40 && saved <= 85) {
+        return saved;
+      }
+    } catch {
+      // Ignore storage access errors
+    }
+    return 60;
+  });
 
-  // Batch import state persisted across tab switches
   const [importQueue, setImportQueue] = useState<ImportQueueItem[]>([]);
   const [isImporting, setIsImporting] = useState(false);
   const [mergeIndexedSuffixes, setMergeIndexedSuffixes] = useState(true);
+
+  const handleChangeMinSimilarity = useCallback((value: number) => {
+    const clamped = Math.max(40, Math.min(85, Math.round(value)));
+    setMinSimilarity(clamped);
+    try {
+      localStorage.setItem('face_roster_min_similarity', String(clamped));
+    } catch {
+      // Ignore storage access errors
+    }
+  }, []);
 
   const bootEngine = useCallback(async () => {
     setEngineState({
@@ -78,7 +90,7 @@ export default function App() {
       });
       setEngineState({
         status: 'ready',
-        progressText: '人脸识别模型已就绪',
+        progressText: '模型已就绪',
       });
     } catch (err) {
       setEngineState({
@@ -90,18 +102,13 @@ export default function App() {
     }
   }, []);
 
-  // Load local IndexedDB data + neural engine on startup
   useEffect(() => {
     void (async () => {
       try {
-        const [storedPersons, storedHistory] = await Promise.all([
-          getAllPersons(),
-          getAllHistory(),
-        ]);
+        const storedPersons = await getAllPersons();
         setPersons(storedPersons);
-        setHistory(storedHistory);
       } catch {
-        // Ignore IndexedDB error if private mode blocks storage
+        // Ignore IndexedDB errors if private mode restricts access
       }
     })();
     void bootEngine();
@@ -112,23 +119,35 @@ export default function App() {
     [persons]
   );
 
-  // Upsert a person record by name (merging multiple samples if name already exists)
+  const hasCustomOrder = useMemo(
+    () => persons.some((p) => typeof p.sortOrder === 'number'),
+    [persons]
+  );
+
   const upsertPersonSample = useCallback(
     async (
       name: string,
       sample: FaceSample,
       note = '',
       currentList: PersonRecord[]
-    ): Promise<{ updatedList: PersonRecord[]; person: PersonRecord; merged: boolean }> => {
+    ): Promise<{
+      updatedList: PersonRecord[];
+      person: PersonRecord;
+      merged: boolean;
+    }> => {
       const normalized = name.trim() || '未命名人物';
       const existingIndex = currentList.findIndex(
         (p) => p.name.trim().toLowerCase() === normalized.toLowerCase()
       );
 
       const now = Date.now();
+      const customOrderActive = currentList.some(
+        (p) => typeof p.sortOrder === 'number'
+      );
+
       let updatedPerson: PersonRecord;
       let merged = false;
-      let nextList: PersonRecord[];
+      let rawNext: PersonRecord[];
 
       if (existingIndex >= 0) {
         const existing = currentList[existingIndex];
@@ -139,33 +158,37 @@ export default function App() {
           samples: [sample, ...existing.samples],
           updatedAt: now,
         };
-        nextList = [
-          updatedPerson,
-          ...currentList.filter((_, idx) => idx !== existingIndex),
-        ];
+        rawNext = currentList.map((p, idx) =>
+          idx === existingIndex ? updatedPerson : p
+        );
       } else {
+        const maxOrder = customOrderActive
+          ? Math.max(-1, ...currentList.map((p) => p.sortOrder ?? -1))
+          : -1;
         updatedPerson = {
           id: `person-${now}-${Math.random().toString(36).slice(2, 7)}`,
           name: normalized,
           note,
           samples: [sample],
+          sortOrder: customOrderActive ? maxOrder + 1 : undefined,
           createdAt: now,
           updatedAt: now,
         };
-        nextList = [updatedPerson, ...currentList];
+        rawNext = [...currentList, updatedPerson];
       }
 
       await putPerson(updatedPerson);
-      return { updatedList: nextList, person: updatedPerson, merged };
+      return {
+        updatedList: sortPersonsList(rawNext),
+        person: updatedPerson,
+        merged,
+      };
     },
     []
   );
 
   const handleBatchImportFiles = useCallback(
-    async (
-      files: File[],
-      notesMap?: Record<string, string>
-    ) => {
+    async (files: File[]) => {
       if (files.length === 0 || engineState.status !== 'ready') return;
 
       setIsImporting(true);
@@ -178,7 +201,6 @@ export default function App() {
 
       setImportQueue((prev) => [...initialItems, ...prev]);
 
-      // Use latest persisted persons list as working copy during sequential extraction
       let workingPersons = await getAllPersons();
 
       for (let i = 0; i < files.length; i++) {
@@ -204,7 +226,7 @@ export default function App() {
                   ? {
                       ...item,
                       status: 'no-face',
-                      message: '未检测到清晰正面人脸，请更换清晰人像照',
+                      message: '未检测到清晰人脸，已跳过',
                     }
                   : item
               )
@@ -224,7 +246,7 @@ export default function App() {
           const { updatedList, person, merged } = await upsertPersonSample(
             parsedName,
             newSample,
-            notesMap?.[file.name] || '',
+            '',
             workingPersons
           );
 
@@ -252,8 +274,7 @@ export default function App() {
                 ? {
                     ...item,
                     status: 'error',
-                    message:
-                      err instanceof Error ? err.message : '图片解析失败',
+                    message: err instanceof Error ? err.message : '图片解析失败',
                   }
                 : item
             )
@@ -265,32 +286,6 @@ export default function App() {
     },
     [engineState.status, mergeIndexedSuffixes, upsertPersonSample]
   );
-
-  const handleImportSampleProfiles = useCallback(async () => {
-    if (engineState.status !== 'ready' || isImporting) return;
-    setActiveTab('import');
-
-    const files: File[] = [];
-    const notesMap: Record<string, string> = {};
-
-    for (const profile of SAMPLE_PROFILES) {
-      try {
-        const res = await fetch(profile.imageUrl);
-        const blob = await res.blob();
-        const file = new File([blob], profile.filename, {
-          type: blob.type || 'image/jpeg',
-        });
-        files.push(file);
-        notesMap[profile.filename] = profile.note;
-      } catch {
-        // Skip unreachable asset
-      }
-    }
-
-    if (files.length > 0) {
-      await handleBatchImportFiles(files, notesMap);
-    }
-  }, [engineState.status, isImporting, handleBatchImportFiles]);
 
   const handleQuickRegisterFace = useCallback(
     async (
@@ -304,7 +299,7 @@ export default function App() {
         id: `sample-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
         descriptor,
         thumbnail,
-        sourceFilename: `${name.trim()}_实拍录入.jpg`,
+        sourceFilename: `${name.trim()}_实拍.jpg`,
         detectionScore: 0.99,
         createdAt: Date.now(),
       };
@@ -320,6 +315,39 @@ export default function App() {
     [upsertPersonSample]
   );
 
+  const handleReorderPersons = useCallback(async (orderedIds: string[]) => {
+    setPersons((prev) => {
+      const byId = new Map(prev.map((p) => [p.id, p]));
+      const reordered: PersonRecord[] = [];
+
+      orderedIds.forEach((id, idx) => {
+        const item = byId.get(id);
+        if (item) {
+          reordered.push({ ...item, sortOrder: idx });
+          byId.delete(id);
+        }
+      });
+
+      for (const leftover of byId.values()) {
+        reordered.push({ ...leftover, sortOrder: reordered.length });
+      }
+
+      void putPersonsBatch(reordered);
+      return reordered;
+    });
+  }, []);
+
+  const handleResetNameOrder = useCallback(async () => {
+    const cleared = persons.map((p) => {
+      const copy = { ...p };
+      delete copy.sortOrder;
+      return copy;
+    });
+    const sorted = sortPersonsList(cleared);
+    setPersons(sorted);
+    await putPersonsBatch(sorted);
+  }, [persons]);
+
   const handleUpdatePerson = useCallback(
     async (personId: string, name: string, note: string) => {
       const target = persons.find((p) => p.id === personId);
@@ -332,14 +360,17 @@ export default function App() {
       };
       await putPerson(updated);
       setPersons((prev) =>
-        prev.map((p) => (p.id === personId ? updated : p))
+        sortPersonsList(prev.map((p) => (p.id === personId ? updated : p)))
       );
     },
     [persons]
   );
 
   const handleAddSampleToPerson = useCallback(
-    async (personId: string, file: File): Promise<{ ok: boolean; message: string }> => {
+    async (
+      personId: string,
+      file: File
+    ): Promise<{ ok: boolean; message: string }> => {
       const target = persons.find((p) => p.id === personId);
       if (!target) return { ok: false, message: '未找到该人物档案' };
 
@@ -348,7 +379,7 @@ export default function App() {
         const img = await loadImageElement(dataUrl);
         const extracted = await extractPrimaryFaceFromImage(img);
         if (!extracted) {
-          return { ok: false, message: '该照片中未检测到清晰人脸，请换一张正面照' };
+          return { ok: false, message: '该照片未检测到清晰人脸' };
         }
 
         const newSample: FaceSample = {
@@ -366,8 +397,10 @@ export default function App() {
           updatedAt: Date.now(),
         };
         await putPerson(updated);
-        setPersons((prev) => prev.map((p) => (p.id === personId ? updated : p)));
-        return { ok: true, message: '已成功补充 1 组 128 维面部特征样本' };
+        setPersons((prev) =>
+          prev.map((p) => (p.id === personId ? updated : p))
+        );
+        return { ok: true, message: '已补充 1 组面部特征样本' };
       } catch (err) {
         return {
           ok: false,
@@ -419,7 +452,8 @@ export default function App() {
 
         for (const incoming of restored) {
           const idx = working.findIndex(
-            (p) => p.name.trim().toLowerCase() === incoming.name.trim().toLowerCase()
+            (p) =>
+              p.name.trim().toLowerCase() === incoming.name.trim().toLowerCase()
           );
           if (idx >= 0) {
             const mergedSamples = [...incoming.samples, ...working[idx].samples];
@@ -434,7 +468,7 @@ export default function App() {
             working[idx] = mergedPerson;
           } else {
             await putPerson(incoming);
-            working = [incoming, ...working];
+            working = [...working, incoming];
           }
         }
 
@@ -442,7 +476,7 @@ export default function App() {
         setPersons(refreshed);
         return {
           ok: true,
-          message: `已成功恢复 ${restored.length} 位人物的面部特征数据`,
+          message: `已恢复 ${restored.length} 位人物的特征数据`,
         };
       } catch (err) {
         return {
@@ -454,96 +488,22 @@ export default function App() {
     []
   );
 
-  const handleRecordHistory = useCallback(async (entry: RecognitionHistoryEntry) => {
-    await addHistoryEntry(entry);
-    setHistory((prev) => [entry, ...prev].slice(0, 60));
-  }, []);
-
-  const handleDeleteHistory = useCallback(async (id: string) => {
-    await deleteHistoryEntry(id);
-    setHistory((prev) => prev.filter((item) => item.id !== id));
-  }, []);
-
-  const handleClearHistory = useCallback(async () => {
-    await clearAllHistory();
-    setHistory([]);
-  }, []);
-
   return (
-    <div className="min-h-screen flex flex-col bg-[#F6F7F9] text-slate-900">
-      {/* Sticky Top App Bar (Clean 3-Zone Contract on Desktop, Compact 52px Mobile Header) */}
-      <header className="sticky top-0 z-30 h-[52px] lg:h-16 bg-white/90 backdrop-blur-md border-b border-slate-200/80">
-        <div className="max-w-7xl mx-auto h-full px-4 sm:px-6 flex items-center justify-between gap-8">
-          {/* Zone 1: Single-line Brand Wordmark */}
-          <button
-            type="button"
-            onClick={() => setActiveTab('camera')}
-            className="text-base lg:text-lg font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-blue-600 rounded"
-          >
-            面谱识人
-          </button>
-
-          {/* Zone 2: Desktop Single-Line Navigation Links */}
-          <nav
-            aria-label="主导航"
-            className="hidden lg:flex items-center gap-7 text-sm font-medium"
-          >
-            {NAV_ITEMS.map((item) => {
-              const active = activeTab === item.id;
-              return (
-                <button
-                  key={item.id}
-                  type="button"
-                  onClick={() => setActiveTab(item.id)}
-                  className={`relative py-5 transition-colors whitespace-nowrap shrink-0 ${
-                    active
-                      ? 'text-blue-600'
-                      : 'text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  <span>{item.label}</span>
-                  {item.id === 'library' && persons.length > 0 && (
-                    <span className="ml-1 text-xs font-mono text-slate-400 tabular-nums">
-                      {persons.length}
-                    </span>
-                  )}
-                  {active && (
-                    <span className="absolute inset-x-0 bottom-0 h-0.5 bg-blue-600 rounded-full" />
-                  )}
-                </button>
-              );
-            })}
-          </nav>
-
-          {/* Zone 3: Single Primary Contextual Action */}
-          <div className="flex items-center shrink-0">
-            <button
-              type="button"
-              onClick={() =>
-                setActiveTab(activeTab === 'import' ? 'camera' : 'import')
-              }
-              className="min-h-[38px] lg:min-h-[40px] px-3.5 lg:px-4 py-1.5 rounded-xl bg-blue-600 text-white text-xs lg:text-sm font-medium hover:bg-blue-700 active:scale-[0.98] transition-all whitespace-nowrap shrink-0"
-            >
-              {activeTab === 'import' ? '去拍照识别' : '批量导入照片'}
-            </button>
-          </div>
-        </div>
-      </header>
-
-      {/* Real Model Initialization Progress Notice (Shown only while loading or on error) */}
+    <div className="min-h-screen flex flex-col bg-[#F8F8F7] text-[#141413]">
+      {/* Subtle Engine Status Notice (Only while loading or on error) */}
       {engineState.status === 'loading' && (
-        <div className="max-w-7xl w-full mx-auto px-4 sm:px-6 pt-4">
-          <div className="bg-white border border-slate-200/80 rounded-2xl px-4 py-3 flex items-center gap-3 text-sm text-slate-700">
-            <Loader2 className="w-4 h-4 text-blue-600 animate-spin shrink-0" />
+        <div className="max-w-4xl w-full mx-auto px-4 pt-3">
+          <div className="bg-white border border-neutral-200/90 rounded-xl px-3.5 py-2.5 flex items-center gap-2.5 text-xs text-neutral-600">
+            <Loader2 className="w-3.5 h-3.5 text-neutral-800 animate-spin shrink-0" />
             <span className="truncate">{engineState.progressText}</span>
           </div>
         </div>
       )}
 
       {engineState.status === 'error' && (
-        <div className="max-w-7xl w-full mx-auto px-4 sm:px-6 pt-4">
-          <div className="bg-amber-50 border border-amber-200 rounded-2xl px-4 py-3 flex items-center justify-between gap-3 text-sm text-amber-900">
-            <div className="flex items-center gap-2.5 min-w-0">
+        <div className="max-w-4xl w-full mx-auto px-4 pt-3">
+          <div className="bg-amber-50 border border-amber-200 rounded-xl px-3.5 py-2.5 flex items-center justify-between gap-3 text-xs text-amber-900">
+            <div className="flex items-center gap-2 min-w-0">
               <AlertCircle className="w-4 h-4 shrink-0" />
               <span className="truncate">
                 {engineState.errorMessage || '本地人脸模型加载失败'}
@@ -552,92 +512,86 @@ export default function App() {
             <button
               type="button"
               onClick={() => void bootEngine()}
-              className="min-h-[36px] px-3 rounded-lg bg-amber-900 text-white text-xs font-medium shrink-0 whitespace-nowrap"
+              className="min-h-[34px] px-3 rounded-lg bg-amber-900 text-white text-xs font-medium shrink-0"
             >
-              重新加载
+              重试
             </button>
           </div>
         </div>
       )}
 
-      {/* Main Content Area (Extra bottom padding on mobile for fixed thumb tab bar) */}
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-5 pb-24 lg:py-7 lg:pb-12">
+      {/* Main Content Above Bottom Minimalist Toolbar */}
+      <main className="flex-1 max-w-4xl w-full mx-auto px-4 sm:px-6 pt-4 pb-24">
         {activeTab === 'camera' && (
           <CameraRecognizeView
             persons={persons}
             engineState={engineState}
-            threshold={threshold}
-            onChangeThreshold={setThreshold}
+            minSimilarity={minSimilarity}
             onQuickRegisterFace={handleQuickRegisterFace}
-            onRecordHistory={handleRecordHistory}
-            onGoToImport={() => setActiveTab('import')}
-            onImportSamples={handleImportSampleProfiles}
-            isImporting={isImporting}
           />
         )}
 
-        {activeTab === 'import' && (
-          <BatchImportView
+        {activeTab === 'album' && (
+          <AlbumView
+            persons={persons}
+            hasCustomOrder={hasCustomOrder}
+            engineState={engineState}
+            onReorderPersons={handleReorderPersons}
+            onResetNameOrder={handleResetNameOrder}
+            onUpdatePerson={handleUpdatePerson}
+            onAddSampleToPerson={handleAddSampleToPerson}
+            onDeleteSample={handleDeleteSample}
+            onDeletePerson={handleDeletePerson}
+          />
+        )}
+
+        {activeTab === 'settings' && (
+          <SettingsView
             engineState={engineState}
             personCount={persons.length}
             totalSampleCount={totalSampleCount}
             queue={importQueue}
             isImporting={isImporting}
             mergeIndexedSuffixes={mergeIndexedSuffixes}
+            minSimilarity={minSimilarity}
             onToggleMergeSuffixes={setMergeIndexedSuffixes}
             onImportFiles={(files) => handleBatchImportFiles(files)}
-            onImportSamples={handleImportSampleProfiles}
             onClearQueue={() => setImportQueue([])}
-            onGoToCamera={() => setActiveTab('camera')}
-            onGoToLibrary={() => setActiveTab('library')}
-          />
-        )}
-
-        {activeTab === 'library' && (
-          <PeopleLibraryView
-            persons={persons}
-            engineState={engineState}
-            onUpdatePerson={handleUpdatePerson}
-            onAddSampleToPerson={handleAddSampleToPerson}
-            onDeleteSample={handleDeleteSample}
-            onDeletePerson={handleDeletePerson}
+            onChangeMinSimilarity={handleChangeMinSimilarity}
             onExportBackup={handleExportBackup}
             onImportBackup={handleImportBackup}
-            onGoToImport={() => setActiveTab('import')}
-          />
-        )}
-
-        {activeTab === 'history' && (
-          <HistoryView
-            history={history}
-            onDeleteEntry={handleDeleteHistory}
-            onClearAll={handleClearHistory}
-            onGoToCamera={() => setActiveTab('camera')}
           />
         )}
       </main>
 
-      {/* Mobile Fixed Bottom Thumb-Zone Tab Bar (Hidden on Desktop >= 1024px) */}
+      {/* Fixed Minimalist Bottom 3-Icon Toolbar (拍照 · 相册 · 设置) */}
       <nav
-        aria-label="底部功能切换"
-        className="lg:hidden fixed bottom-0 left-0 right-0 z-40 bg-white/95 backdrop-blur-md border-t border-slate-200/80 pb-safe"
+        aria-label="底部功能工具条"
+        className="fixed bottom-0 left-0 right-0 z-40 bg-white/95 backdrop-blur-md border-t border-neutral-200/80 pb-safe"
       >
-        <div className="grid grid-cols-4 h-[60px] items-center">
-          {NAV_ITEMS.map((item) => {
-            const Icon = item.icon;
-            const active = activeTab === item.id;
+        <div className="max-w-4xl mx-auto grid grid-cols-3 h-[58px] items-center">
+          {BOTTOM_TABS.map((tab) => {
+            const Icon = tab.icon;
+            const active = activeTab === tab.id;
             return (
               <button
-                key={item.id}
+                key={tab.id}
                 type="button"
-                onClick={() => setActiveTab(item.id)}
+                aria-label={tab.label}
+                aria-current={active ? 'page' : undefined}
+                onClick={() => setActiveTab(tab.id)}
                 className={`min-h-[48px] flex flex-col items-center justify-center gap-0.5 transition-colors ${
-                  active ? 'text-blue-600' : 'text-slate-500'
+                  active
+                    ? 'text-[#141413]'
+                    : 'text-neutral-400 hover:text-neutral-600'
                 }`}
               >
-                <Icon className="w-[21px] h-[21px]" />
-                <span className="text-[11px] font-medium tracking-tight whitespace-nowrap">
-                  {item.mobileLabel}
+                <Icon
+                  className="w-[21px] h-[21px]"
+                  strokeWidth={active ? 2.15 : 1.65}
+                />
+                <span className="text-[10px] font-medium tracking-wide whitespace-nowrap">
+                  {tab.label}
                 </span>
               </button>
             );
