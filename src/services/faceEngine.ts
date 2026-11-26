@@ -215,6 +215,7 @@ export function prepareCanvasFromImage(
 export interface ExtractedFaceFeature {
   descriptor: number[];
   thumbnail: string;
+  originalPhoto: string;
   detectionScore: number;
   box: NormalizedBox;
 }
@@ -258,10 +259,12 @@ export async function extractPrimaryFaceFromImage(
   const primary = detections[0];
   const { box, score } = primary.detection;
   const thumbnail = cropFaceThumbnail(canvas, box, 240);
+  const originalPhoto = createSnapshotDataUrl(canvas, 760).dataUrl;
 
   return {
     descriptor: Array.from(primary.descriptor),
     thumbnail,
+    originalPhoto,
     detectionScore: Number(score.toFixed(3)),
     box: {
       x: box.x / canvas.width,
@@ -329,7 +332,7 @@ export async function recognizeFacesInSource(
 
   let inputElement: HTMLCanvasElement | HTMLVideoElement =
     source instanceof HTMLImageElement
-      ? prepareCanvasFromImage(source, 1024)
+      ? prepareCanvasFromImage(source, 1440)
       : source;
 
   const sourceWidth =
@@ -353,12 +356,22 @@ export async function recognizeFacesInSource(
   const options =
     mode === 'fast'
       ? new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.42 })
-      : new faceapi.SsdMobilenetv1Options({ minConfidence: 0.42 });
+      : new faceapi.SsdMobilenetv1Options({ minConfidence: 0.4 });
 
-  const detections = await faceapi
+  let detections = await faceapi
     .detectAllFaces(inputElement, options)
     .withFaceLandmarks()
     .withFaceDescriptors();
+
+  if (detections.length === 0 && mode === 'accurate') {
+    detections = await faceapi
+      .detectAllFaces(
+        inputElement,
+        new faceapi.TinyFaceDetectorOptions({ inputSize: 512, scoreThreshold: 0.3 })
+      )
+      .withFaceLandmarks()
+      .withFaceDescriptors();
+  }
 
   // Sort left-to-right for natural reading order in group shots
   detections.sort((a, b) => a.detection.box.x - b.detection.box.x);

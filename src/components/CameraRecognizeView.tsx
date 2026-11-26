@@ -1,9 +1,18 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Camera, Loader2, ScanFace, UserPlus, Video } from 'lucide-react';
+import React, { useMemo, useRef, useState } from 'react';
+import { Camera as CameraIcon, Loader2, UserPlus } from 'lucide-react';
+import { Capacitor } from '@capacitor/core';
+import {
+  Camera as NativeCamera,
+  CameraDirection,
+  CameraResultType,
+  CameraSource,
+} from '@capacitor/camera';
 import * as faceapi from '@vladmandic/face-api';
 import type { EngineState, PersonRecord, RecognizedFace } from '../types/face';
 import {
   distanceToSimilarity,
+  loadImageElement,
+  readFileAsDataUrl,
   recognizeFacesInSource,
   similarityToDistance,
 } from '../services/faceEngine';
@@ -16,28 +25,9 @@ interface CameraRecognizeViewProps {
     name: string,
     note: string,
     descriptor: number[],
-    thumbnail: string
+    thumbnail: string,
+    originalPhoto?: string
   ) => Promise<PersonRecord>;
-}
-
-interface ZoomCapabilities extends MediaTrackCapabilities {
-  zoom?: {
-    min: number;
-    max: number;
-    step?: number;
-  };
-}
-
-interface ZoomSettings extends MediaTrackSettings {
-  zoom?: number;
-}
-
-interface ZoomConstraintSet extends MediaTrackConstraintSet {
-  zoom?: number;
-}
-
-function getTouchDistance(t1: React.Touch, t2: React.Touch): number {
-  return Math.hypot(t1.clientX - t2.clientX, t1.clientY - t2.clientY);
 }
 
 export const CameraRecognizeView: React.FC<CameraRecognizeViewProps> = ({
@@ -46,38 +36,15 @@ export const CameraRecognizeView: React.FC<CameraRecognizeViewProps> = ({
   minSimilarity,
   onQuickRegisterFace,
 }) => {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const videoTrackRef = useRef<MediaStreamTrack | null>(null);
+  const webCaptureInputRef = useRef<HTMLInputElement>(null);
 
-  const [cameraActive, setCameraActive] = useState(false);
-  const [cameraStarting, setCameraStarting] = useState(false);
-  const [cameraError, setCameraError] = useState<string | null>(null);
-
-  // Hardware + fallback digital zoom state
-  const [zoom, setZoom] = useState(1);
-  const [minZoom, setMinZoom] = useState(1);
-  const [maxZoom, setMaxZoom] = useState(4);
-  const [hardwareZoomSupported, setHardwareZoomSupported] = useState(false);
-  const [zoomBadgeVisible, setZoomBadgeVisible] = useState(false);
-
-  const zoomStepRef = useRef(0.1);
-  const zoomRef = useRef(1);
-  zoomRef.current = zoom;
-  const zoomApplyingRef = useRef(false);
-  const pendingZoomRef = useRef<number | null>(null);
-  const zoomBadgeTimerRef = useRef<number | null>(null);
-  const pinchStateRef = useRef<{
-    startDist: number;
-    startZoom: number;
-  } | null>(null);
-
+  const [capturedPhotoUrl, setCapturedPhotoUrl] = useState<string | null>(null);
   const [capturedFaces, setCapturedFaces] = useState<RecognizedFace[]>([]);
   const [selectedFaceId, setSelectedFaceId] = useState<string | null>(null);
   const [elapsedMs, setElapsedMs] = useState<number | null>(null);
   const [hasAttemptedCapture, setHasAttemptedCapture] = useState(false);
+  const [isCapturing, setIsCapturing] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [shutterFlash, setShutterFlash] = useState(false);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
 
   const [registerName, setRegisterName] = useState('');
@@ -88,163 +55,7 @@ export const CameraRecognizeView: React.FC<CameraRecognizeViewProps> = ({
     [minSimilarity]
   );
 
-  const showZoomBadgeBriefly = useCallback(() => {
-    setZoomBadgeVisible(true);
-    if (zoomBadgeTimerRef.current !== null) {
-      window.clearTimeout(zoomBadgeTimerRef.current);
-    }
-    zoomBadgeTimerRef.current = window.setTimeout(() => {
-      setZoomBadgeVisible(false);
-    }, 1600);
-  }, []);
-
-  const applyZoomValue = useCallback(
-    async (rawNextZoom: number) => {
-      const clamped = Math.max(minZoom, Math.min(maxZoom, rawNextZoom));
-      const step = zoomStepRef.current;
-      const snapped =
-        step > 0
-          ? Math.round((clamped - minZoom) / step) * step + minZoom
-          : clamped;
-      const cleanZoom = Number(
-        Math.max(minZoom, Math.min(maxZoom, snapped)).toFixed(2)
-      );
-
-      setZoom(cleanZoom);
-      showZoomBadgeBriefly();
-
-      if (!hardwareZoomSupported || !videoTrackRef.current) {
-        return;
-      }
-
-      if (zoomApplyingRef.current) {
-        pendingZoomRef.current = cleanZoom;
-        return;
-      }
-
-      zoomApplyingRef.current = true;
-      try {
-        let target: number | null = cleanZoom;
-        while (target !== null && videoTrackRef.current) {
-          pendingZoomRef.current = null;
-          const constraint: ZoomConstraintSet = { zoom: target };
-          await videoTrackRef.current.applyConstraints({
-            advanced: [constraint],
-          });
-          target = pendingZoomRef.current;
-        }
-      } catch {
-        // Ignore transient hardware zoom rejections
-      } finally {
-        zoomApplyingRef.current = false;
-      }
-    },
-    [hardwareZoomSupported, maxZoom, minZoom, showZoomBadgeBriefly]
-  );
-
-  const stopCamera = useCallback(() => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
-    }
-    videoTrackRef.current = null;
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
-    }
-    setCameraActive(false);
-  }, []);
-
-  const startRearCamera = useCallback(async () => {
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      setCameraError('当前设备不支持调用摄像头。');
-      return;
-    }
-
-    stopCamera();
-    setCameraStarting(true);
-    setCameraError(null);
-
-    try {
-      let stream: MediaStream;
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: { ideal: 'environment' },
-            width: { ideal: 1280 },
-            height: { ideal: 960 },
-          },
-          audio: false,
-        });
-      } catch {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: true,
-          audio: false,
-        });
-      }
-
-      streamRef.current = stream;
-      const track = stream.getVideoTracks()[0] || null;
-      videoTrackRef.current = track;
-
-      // Inspect native system camera hardware zoom capability
-      const caps = track?.getCapabilities
-        ? (track.getCapabilities() as ZoomCapabilities)
-        : null;
-
-      if (caps?.zoom && caps.zoom.max > caps.zoom.min) {
-        const settings = track?.getSettings
-          ? (track.getSettings() as ZoomSettings)
-          : null;
-        const hwMin = Number(caps.zoom.min);
-        const hwMax = Number(caps.zoom.max);
-        const hwStep = Number(caps.zoom.step) || 0.1;
-        const initial =
-          typeof settings?.zoom === 'number'
-            ? Math.max(hwMin, Math.min(hwMax, settings.zoom))
-            : hwMin;
-
-        setHardwareZoomSupported(true);
-        setMinZoom(hwMin);
-        setMaxZoom(hwMax);
-        zoomStepRef.current = hwStep;
-        setZoom(Number(initial.toFixed(2)));
-      } else {
-        // Fallback smooth digital sensor-crop zoom when hardware zoom is unavailable
-        setHardwareZoomSupported(false);
-        setMinZoom(1);
-        setMaxZoom(4);
-        zoomStepRef.current = 0.05;
-        setZoom(1);
-      }
-
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play();
-      }
-      setCameraActive(true);
-    } catch (err) {
-      const message =
-        err instanceof DOMException && err.name === 'NotAllowedError'
-          ? '摄像头权限未开启，请在系统或浏览器中允许访问相机。'
-          : '未检测到可用摄像头，请检查设备相机状态。';
-      setCameraError(message);
-    } finally {
-      setCameraStarting(false);
-    }
-  }, [stopCamera]);
-
-  useEffect(() => {
-    void startRearCamera();
-    return () => {
-      if (zoomBadgeTimerRef.current !== null) {
-        window.clearTimeout(zoomBadgeTimerRef.current);
-      }
-      stopCamera();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Re-evaluate captured faces immediately when library or similarity setting changes
+  // Re-evaluate captured faces immediately whenever library or similarity setting changes
   const evaluatedFaces = useMemo(() => {
     if (capturedFaces.length === 0) return [];
     return capturedFaces.map((face) => {
@@ -292,55 +103,17 @@ export const CameraRecognizeView: React.FC<CameraRecognizeViewProps> = ({
     evaluatedFaces[0] ??
     null;
 
-  /**
-   * Captures current video frame; if using digital zoom fallback (> 1x), crops the zoomed center region.
-   */
-  const buildCaptureSourceFromVideo = (
-    video: HTMLVideoElement
-  ): HTMLVideoElement | HTMLCanvasElement => {
-    if (hardwareZoomSupported || zoomRef.current <= 1.01) {
-      return video;
-    }
-
-    const vw = video.videoWidth;
-    const vh = video.videoHeight;
-    if (vw === 0 || vh === 0) return video;
-
-    const factor = zoomRef.current;
-    const cropW = vw / factor;
-    const cropH = vh / factor;
-    const sx = (vw - cropW) / 2;
-    const sy = (vh - cropH) / 2;
-
-    const canvas = document.createElement('canvas');
-    canvas.width = Math.round(vw);
-    canvas.height = Math.round(vh);
-    const ctx = canvas.getContext('2d');
-    if (ctx) {
-      ctx.drawImage(video, sx, sy, cropW, cropH, 0, 0, canvas.width, canvas.height);
-    }
-    return canvas;
-  };
-
-  const handleCaptureClick = async () => {
-    if (engineState.status !== 'ready' || isAnalyzing) return;
-    if (!cameraActive || !videoRef.current) {
-      await startRearCamera();
-      return;
-    }
-
-    setShutterFlash(true);
-    window.setTimeout(() => setShutterFlash(false), 140);
-
+  const analyzeDataUrl = async (dataUrl: string) => {
+    setCapturedPhotoUrl(dataUrl);
     setIsAnalyzing(true);
     setAnalysisError(null);
     setHasAttemptedCapture(true);
     setRegisterName('');
 
     try {
-      const source = buildCaptureSourceFromVideo(videoRef.current);
+      const img = await loadImageElement(dataUrl);
       const result = await recognizeFacesInSource(
-        source,
+        img,
         persons,
         internalCutoff,
         'accurate'
@@ -350,43 +123,63 @@ export const CameraRecognizeView: React.FC<CameraRecognizeViewProps> = ({
       setSelectedFaceId(result.faces[0]?.id ?? null);
     } catch (err) {
       setAnalysisError(
-        err instanceof Error ? err.message : '识别失败，请调整光线后重试'
+        err instanceof Error ? err.message : '照片识别失败，请重新拍摄'
       );
+      setCapturedFaces([]);
+      setSelectedFaceId(null);
     } finally {
       setIsAnalyzing(false);
     }
   };
 
-  // Two-finger pinch-to-zoom handlers
-  const handleTouchStart = (e: React.TouchEvent<HTMLElement>) => {
-    if (!cameraActive || e.touches.length !== 2) return;
-    const dist = getTouchDistance(e.touches[0], e.touches[1]);
-    if (dist > 0) {
-      pinchStateRef.current = {
-        startDist: dist,
-        startZoom: zoomRef.current,
-      };
+  const handleOpenSystemCamera = async () => {
+    if (engineState.status !== 'ready' || isCapturing || isAnalyzing) return;
+    setAnalysisError(null);
+
+    if (Capacitor.isNativePlatform()) {
+      setIsCapturing(true);
+      try {
+        const photo = await NativeCamera.getPhoto({
+          source: CameraSource.Camera,
+          direction: CameraDirection.Rear,
+          resultType: CameraResultType.DataUrl,
+          quality: 92,
+          width: 2048,
+          correctOrientation: true,
+          allowEditing: false,
+          saveToGallery: false,
+        });
+
+        if (photo.dataUrl) {
+          await analyzeDataUrl(photo.dataUrl);
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        // Silently ignore when user taps Back/Cancel in the system camera
+        if (!/cancel|dismiss|abort/i.test(msg)) {
+          setAnalysisError('无法打开系统相机，请检查应用相机权限设置');
+        }
+      } finally {
+        setIsCapturing(false);
+      }
+      return;
     }
+
+    // Mobile & desktop web browser fallback: launches native camera on mobile browsers
+    webCaptureInputRef.current?.click();
   };
 
-  const handleTouchMove = (e: React.TouchEvent<HTMLElement>) => {
-    if (!cameraActive || e.touches.length !== 2 || !pinchStateRef.current) return;
-    const currentDist = getTouchDistance(e.touches[0], e.touches[1]);
-    const ratio = currentDist / pinchStateRef.current.startDist;
-    const nextZoom = pinchStateRef.current.startZoom * ratio;
-    void applyZoomValue(nextZoom);
-  };
+  const handleWebInputChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
 
-  const handleTouchEnd = (e: React.TouchEvent<HTMLElement>) => {
-    if (e.touches.length < 2) {
-      pinchStateRef.current = null;
+    try {
+      const dataUrl = await readFileAsDataUrl(file);
+      await analyzeDataUrl(dataUrl);
+    } catch (err) {
+      setAnalysisError(err instanceof Error ? err.message : '无法读取拍摄照片');
     }
-  };
-
-  const handleWheelZoom = (e: React.WheelEvent<HTMLElement>) => {
-    if (!cameraActive) return;
-    const delta = e.deltaY < 0 ? 0.15 : -0.15;
-    void applyZoomValue(zoomRef.current + delta);
   };
 
   const handleQuickSave = async (e: React.FormEvent) => {
@@ -398,7 +191,8 @@ export const CameraRecognizeView: React.FC<CameraRecognizeViewProps> = ({
         registerName.trim(),
         '',
         activeFace.descriptor,
-        activeFace.cropThumbnail
+        activeFace.cropThumbnail,
+        capturedPhotoUrl ?? undefined
       );
       setRegisterName('');
     } finally {
@@ -406,92 +200,115 @@ export const CameraRecognizeView: React.FC<CameraRecognizeViewProps> = ({
     }
   };
 
-  const displayZoomRatio = minZoom > 0 ? zoom / minZoom : zoom;
-  const isZoomedIn = displayZoomRatio > 1.04;
+  const isBusy = engineState.status !== 'ready' || isCapturing || isAnalyzing;
 
   return (
     <div className="flex flex-col gap-4 h-full">
-      {/* UPPER HALF: Rear Camera Viewfinder with Pinch-to-Zoom & Shutter Button */}
+      {/* Hidden native-capture input for mobile web browser fallback */}
+      <input
+        ref={webCaptureInputRef}
+        type="file"
+        accept="image/*"
+        capture="environment"
+        onChange={handleWebInputChange}
+        className="hidden"
+      />
+
+      {/* UPPER HALF: Native System Camera Trigger & High-Resolution Photo Preview */}
       <section
-        aria-label="后置摄像头拍照区"
-        onTouchStart={handleTouchStart}
-        onTouchMove={handleTouchMove}
-        onTouchEnd={handleTouchEnd}
-        onTouchCancel={handleTouchEnd}
-        onWheel={handleWheelZoom}
-        className="touch-none relative w-full bg-[#111214] rounded-2xl overflow-hidden border border-neutral-200/80 flex items-center justify-center min-h-[280px] h-[47vh] sm:h-[50vh] max-h-[520px] select-none"
+        aria-label="原生相机拍摄区"
+        className={`relative w-full rounded-2xl overflow-hidden border border-neutral-200/90 flex items-center justify-center min-h-[260px] h-[46vh] sm:h-[48vh] max-h-[500px] ${
+          capturedPhotoUrl ? 'bg-[#111214]' : 'bg-white'
+        }`}
       >
-        <video
-          ref={videoRef}
-          playsInline
-          muted
-          style={
-            !hardwareZoomSupported && zoom > 1
-              ? { transform: `scale(${zoom})`, transformOrigin: 'center center' }
-              : undefined
-          }
-          className={`w-full h-full object-cover transition-transform duration-75 ${
-            cameraActive ? 'block' : 'hidden'
-          }`}
-        />
+        {capturedPhotoUrl ? (
+          <>
+            {/* Tightly Fitted Photo Stage so Face Boxes Align Precisely */}
+            <div className="relative inline-flex items-center justify-center max-w-full max-h-full">
+              <img
+                src={capturedPhotoUrl}
+                alt="系统相机拍摄照片"
+                referrerPolicy="no-referrer"
+                className="block max-h-[46vh] sm:max-h-[48vh] max-w-full w-auto h-auto"
+              />
 
-        {/* Camera Idle / Permission Fallback */}
-        {!cameraActive && (
-          <div className="px-6 py-8 text-center max-w-sm space-y-4">
-            <div className="mx-auto w-11 h-11 rounded-2xl bg-white/10 flex items-center justify-center text-white/80">
-              <ScanFace className="w-5 h-5" strokeWidth={1.75} />
-            </div>
-            <p className="text-xs text-neutral-300 leading-relaxed">
-              {cameraStarting
-                ? '正在启动后置摄像头...'
-                : cameraError || '点击下方按钮开启后置摄像头'}
-            </p>
-            <button
-              type="button"
-              disabled={cameraStarting}
-              onClick={() => void startRearCamera()}
-              className="min-h-[42px] px-4 py-2 rounded-xl bg-white text-neutral-950 text-xs font-medium hover:bg-neutral-100 inline-flex items-center gap-1.5 transition-colors disabled:opacity-50"
-            >
-              {cameraStarting ? (
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              ) : (
-                <Video className="w-3.5 h-3.5" />
+              {/* Clickable Face Boxes for Multi-Person Shots */}
+              {evaluatedFaces.length > 0 && (
+                <div className="absolute inset-0 pointer-events-none">
+                  {evaluatedFaces.map((face) => {
+                    const matched = Boolean(face.matchedPerson);
+                    const isSelected = activeFace?.id === face.id;
+                    return (
+                      <button
+                        key={face.id}
+                        type="button"
+                        onClick={() => setSelectedFaceId(face.id)}
+                        style={{
+                          left: `${face.box.x * 100}%`,
+                          top: `${face.box.y * 100}%`,
+                          width: `${face.box.width * 100}%`,
+                          height: `${face.box.height * 100}%`,
+                        }}
+                        aria-label={face.matchedPerson?.personName ?? '未匹配人脸'}
+                        className={`pointer-events-auto absolute rounded-md transition-all ${
+                          matched
+                            ? isSelected
+                              ? 'ring-2 ring-emerald-400 bg-emerald-400/10'
+                              : 'ring-1 ring-emerald-400/80'
+                            : isSelected
+                              ? 'ring-2 ring-white bg-white/10'
+                              : 'ring-1 ring-white/70'
+                        }`}
+                      />
+                    );
+                  })}
+                </div>
               )}
-              <span>开启摄像头</span>
-            </button>
-          </div>
-        )}
+            </div>
 
-        {/* Minimal Floating Zoom Multiplier (Visible while pinching or zoomed in; tap to reset 1x) */}
-        {cameraActive && (zoomBadgeVisible || isZoomedIn) && (
-          <button
-            type="button"
-            onClick={() => void applyZoomValue(minZoom)}
-            aria-label="重置焦距为 1 倍"
-            className="absolute bottom-[86px] left-1/2 -translate-x-1/2 z-20 min-h-[30px] px-2.5 rounded-full bg-black/50 backdrop-blur-xs text-white text-xs font-mono tabular-nums hover:bg-black/70 transition-opacity"
-          >
-            {displayZoomRatio.toFixed(1)}×
-          </button>
-        )}
-
-        {/* Shutter Button Anchored Bottom-Center of Camera Area */}
-        {cameraActive && (
-          <div className="absolute inset-x-0 bottom-4 z-20 flex flex-col items-center pointer-events-none">
+            {/* Bottom-Center Tactile Re-Shoot Button */}
+            <div className="absolute inset-x-0 bottom-4 z-20 flex justify-center pointer-events-none">
+              <button
+                type="button"
+                disabled={isBusy}
+                onClick={() => void handleOpenSystemCamera()}
+                aria-label="重新调用系统相机拍照"
+                className="pointer-events-auto min-h-[48px] px-5 py-2.5 rounded-full bg-white/95 hover:bg-white text-neutral-950 text-xs font-semibold shadow-md backdrop-blur-xs active:scale-95 transition-all inline-flex items-center gap-2 disabled:opacity-50"
+              >
+                {isCapturing || isAnalyzing ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <CameraIcon className="w-4 h-4" strokeWidth={2} />
+                )}
+                <span>继续拍照</span>
+              </button>
+            </div>
+          </>
+        ) : (
+          /* Serene Minimalist Initial Camera Launch Panel */
+          <div className="px-6 py-8 text-center flex flex-col items-center justify-center gap-4">
             <button
               type="button"
-              disabled={engineState.status !== 'ready' || isAnalyzing}
-              onClick={() => void handleCaptureClick()}
-              aria-label="拍照并匹配人物"
-              className="pointer-events-auto w-[62px] h-[62px] rounded-full border-[2.5px] border-white/95 p-1 flex items-center justify-center bg-black/20 backdrop-blur-xs active:scale-92 transition-transform disabled:opacity-50"
+              disabled={isBusy}
+              onClick={() => void handleOpenSystemCamera()}
+              aria-label="调用系统相机拍照"
+              className="w-[76px] h-[76px] rounded-full bg-[#141413] hover:bg-neutral-800 active:scale-95 text-white flex items-center justify-center transition-all disabled:opacity-45"
             >
-              <span className="w-full h-full rounded-full bg-white flex items-center justify-center text-neutral-900">
-                {isAnalyzing ? (
-                  <Loader2 className="w-5 h-5 animate-spin" />
-                ) : (
-                  <Camera className="w-5 h-5" strokeWidth={1.9} />
-                )}
-              </span>
+              {isCapturing || isAnalyzing ? (
+                <Loader2 className="w-7 h-7 animate-spin" />
+              ) : (
+                <CameraIcon className="w-7 h-7" strokeWidth={1.75} />
+              )}
             </button>
+
+            <div className="space-y-1">
+              <p className="text-sm font-medium text-neutral-900">
+                点击调用系统相机拍照
+              </p>
+              <p className="text-xs text-neutral-500">
+                支持原生光学变焦与长焦拍摄，拍完自动识别人物
+              </p>
+            </div>
           </div>
         )}
 
@@ -504,14 +321,9 @@ export const CameraRecognizeView: React.FC<CameraRecognizeViewProps> = ({
             </div>
           </div>
         )}
-
-        {/* Shutter Flash */}
-        {shutterFlash && (
-          <div className="absolute inset-0 z-30 bg-white/80 pointer-events-none" />
-        )}
       </section>
 
-      {/* Multi-face Selector (Only appears if >= 2 faces captured in one photo) */}
+      {/* Multi-face Selector (Only when >= 2 faces detected in a photo) */}
       {evaluatedFaces.length > 1 && (
         <div className="flex items-center gap-2 overflow-x-auto pb-0.5">
           <span className="text-xs text-neutral-500 shrink-0">
@@ -546,16 +358,16 @@ export const CameraRecognizeView: React.FC<CameraRecognizeViewProps> = ({
       {/* LOWER HALF: Strict Left / Right Comparison Split */}
       <section
         aria-label="抓拍与人物库比对结果"
-        className="grid grid-cols-2 gap-3 sm:gap-5 flex-1 items-start"
+        className="grid grid-cols-2 gap-3 sm:gap-5 flex-1 items-stretch"
       >
-        {/* LEFT HALF: Captured Face Crop from Camera */}
-        <div className="bg-white rounded-2xl border border-neutral-200/90 p-3 sm:p-4 space-y-2.5">
-          <div className="flex items-baseline justify-between gap-2">
-            <span className="text-xs font-medium text-neutral-500">
+        {/* LEFT HALF: Captured Face Crop */}
+        <div className="bg-white rounded-2xl border border-neutral-200/90 p-3 sm:p-4 flex flex-col gap-2.5">
+          <div className="h-5 flex items-center justify-between gap-2">
+            <span className="text-xs font-medium text-neutral-500 leading-none">
               抓拍人脸
             </span>
             {elapsedMs !== null && activeFace && (
-              <span className="text-[11px] font-mono text-neutral-400 tabular-nums">
+              <span className="text-[11px] font-mono text-neutral-400 tabular-nums leading-none">
                 {elapsedMs} ms
               </span>
             )}
@@ -565,7 +377,7 @@ export const CameraRecognizeView: React.FC<CameraRecognizeViewProps> = ({
             {activeFace?.cropThumbnail ? (
               <img
                 src={activeFace.cropThumbnail}
-                alt="摄像区抓拍的人脸"
+                alt="抓拍的人脸"
                 referrerPolicy="no-referrer"
                 className="w-full h-full object-cover"
               />
@@ -578,23 +390,23 @@ export const CameraRecognizeView: React.FC<CameraRecognizeViewProps> = ({
             )}
           </div>
 
-          <div className="min-h-[24px] flex items-center justify-between text-xs text-neutral-500">
-            <span className="truncate">
+          <div className="h-7 flex items-center justify-between text-xs text-neutral-500">
+            <span className="truncate leading-normal">
               {activeFace
                 ? `画面清晰度 ${Math.round(activeFace.detectionScore * 100)}%`
-                : '双指开合可调焦'}
+                : '拍完自动检测人脸'}
             </span>
           </div>
         </div>
 
         {/* RIGHT HALF: Matched Person Portrait & Name from Library */}
-        <div className="bg-white rounded-2xl border border-neutral-200/90 p-3 sm:p-4 space-y-2.5">
-          <div className="flex items-baseline justify-between gap-2">
-            <span className="text-xs font-medium text-neutral-500">
+        <div className="bg-white rounded-2xl border border-neutral-200/90 p-3 sm:p-4 flex flex-col gap-2.5">
+          <div className="h-5 flex items-center justify-between gap-2">
+            <span className="text-xs font-medium text-neutral-500 leading-none">
               人物库匹配
             </span>
             {activeFace?.matchedPerson && (
-              <span className="text-[11px] font-mono font-medium text-emerald-700 tabular-nums">
+              <span className="text-[11px] font-mono font-medium text-emerald-700 tabular-nums leading-none">
                 相似度 {activeFace.matchedPerson.similarity}%
               </span>
             )}
@@ -619,19 +431,19 @@ export const CameraRecognizeView: React.FC<CameraRecognizeViewProps> = ({
             )}
           </div>
 
-          <div className="min-h-[24px] flex items-baseline justify-between gap-2">
+          <div className="h-7 flex items-center justify-between gap-2 text-xs">
             {activeFace?.matchedPerson ? (
-              <span className="text-base sm:text-lg font-semibold tracking-tight text-neutral-950 truncate">
+              <span className="text-base sm:text-lg font-semibold tracking-tight text-neutral-950 truncate leading-none">
                 {activeFace.matchedPerson.personName}
               </span>
             ) : activeFace ? (
-              <span className="text-xs text-neutral-500 truncate">
+              <span className="text-xs text-neutral-500 truncate leading-normal">
                 {activeFace.topCandidates[0]
                   ? `最接近 ${activeFace.topCandidates[0].personName}（${activeFace.topCandidates[0].similarity}%）`
                   : '暂无匹配档案'}
               </span>
             ) : (
-              <span className="text-xs text-neutral-400 truncate">
+              <span className="text-xs text-neutral-400 truncate leading-normal">
                 匹配后显示姓名
               </span>
             )}

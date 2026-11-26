@@ -11,6 +11,11 @@ import {
   Upload,
 } from 'lucide-react';
 import type { EngineState, ImportQueueItem } from '../types/face';
+import type { ImportableImageSource } from '../services/nativeStorage';
+import {
+  pickBackupFileNativeOrWeb,
+  pickFolderImagesNativeOrWeb,
+} from '../services/nativeStorage';
 
 interface SettingsViewProps {
   engineState: EngineState;
@@ -22,10 +27,11 @@ interface SettingsViewProps {
   minSimilarity: number;
   onToggleMergeSuffixes: (val: boolean) => void;
   onImportFiles: (files: File[]) => Promise<void>;
+  onImportSources: (sources: ImportableImageSource[]) => Promise<void>;
   onClearQueue: () => void;
   onChangeMinSimilarity: (val: number) => void;
-  onExportBackup: () => void;
-  onImportBackup: (file: File) => Promise<{ ok: boolean; message: string }>;
+  onExportBackup: () => Promise<{ cancelled: boolean; ok: boolean; message: string }>;
+  onImportBackupContent: (rawJson: string) => Promise<{ ok: boolean; message: string }>;
 }
 
 const SIMILARITY_PRESETS = [
@@ -44,15 +50,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   minSimilarity,
   onToggleMergeSuffixes,
   onImportFiles,
+  onImportSources,
   onClearQueue,
   onChangeMinSimilarity,
   onExportBackup,
-  onImportBackup,
+  onImportBackupContent,
 }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
   const backupInputRef = useRef<HTMLInputElement>(null);
 
+  const [backupBusy, setBackupBusy] = useState(false);
   const [backupNotice, setBackupNotice] = useState<{
     type: 'ok' | 'err';
     text: string;
@@ -66,6 +74,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
   }, []);
 
+  const showNotice = (type: 'ok' | 'err', text: string) => {
+    setBackupNotice({ type, text });
+    window.setTimeout(() => setBackupNotice(null), 4500);
+  };
+
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selected = Array.from(e.target.files || []).filter(
       (f) =>
@@ -77,16 +90,85 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
   };
 
-  const handleBackupFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFolderButtonClick = async () => {
+    if (isDisabled) return;
+    try {
+      const result = await pickFolderImagesNativeOrWeb(() => {
+        folderInputRef.current?.click();
+      });
+      if (!result.handled || result.cancelled) return;
+      if (result.items.length === 0) {
+        showNotice('err', '所选文件夹中没有找到可导入的图片文件');
+        return;
+      }
+      await onImportSources(result.items);
+    } catch (err) {
+      showNotice(
+        'err',
+        err instanceof Error ? err.message : '打开文件夹失败，请重试'
+      );
+    }
+  };
+
+  const handleExportClick = async () => {
+    if (backupBusy) return;
+    setBackupBusy(true);
+    try {
+      const res = await onExportBackup();
+      if (!res.cancelled) {
+        showNotice(res.ok ? 'ok' : 'err', res.message);
+      }
+    } catch (err) {
+      showNotice(
+        'err',
+        err instanceof Error ? err.message : '导出备份失败，请重试'
+      );
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+
+  const handleRestoreClick = async () => {
+    if (backupBusy) return;
+    setBackupBusy(true);
+    try {
+      const picked = await pickBackupFileNativeOrWeb(() => {
+        backupInputRef.current?.click();
+      });
+      if (!picked.handled || picked.cancelled || !picked.content) {
+        return;
+      }
+      const res = await onImportBackupContent(picked.content);
+      showNotice(res.ok ? 'ok' : 'err', res.message);
+    } catch (err) {
+      showNotice(
+        'err',
+        err instanceof Error ? err.message : '读取备份文件失败'
+      );
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+
+  const handleBackupInputFallback = async (
+    e: React.ChangeEvent<HTMLInputElement>
+  ) => {
     const file = e.target.files?.[0];
     e.target.value = '';
     if (!file) return;
-    const result = await onImportBackup(file);
-    setBackupNotice({
-      type: result.ok ? 'ok' : 'err',
-      text: result.message,
-    });
-    window.setTimeout(() => setBackupNotice(null), 3500);
+    setBackupBusy(true);
+    try {
+      const content = await file.text();
+      const res = await onImportBackupContent(content);
+      showNotice(res.ok ? 'ok' : 'err', res.message);
+    } catch (err) {
+      showNotice(
+        'err',
+        err instanceof Error ? err.message : '读取备份文件失败'
+      );
+    } finally {
+      setBackupBusy(false);
+    }
   };
 
   const isDisabled = engineState.status !== 'ready' || isImporting;
@@ -100,7 +182,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   return (
     <div className="space-y-5">
-      {/* UPPER SECTION: Batch Import Photos */}
+      {/* UPPER SECTION: Batch Import Photos & Full Backup */}
       <section
         aria-label="导入照片"
         className="bg-white rounded-2xl border border-neutral-200/90 p-5 space-y-4"
@@ -134,7 +216,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           <button
             type="button"
             disabled={isDisabled}
-            onClick={() => folderInputRef.current?.click()}
+            onClick={() => void handleFolderButtonClick()}
             className="min-h-[48px] px-4 py-3 rounded-xl bg-[#F4F4F2] text-neutral-900 text-sm font-medium hover:bg-neutral-200/75 active:scale-[0.98] transition-all flex items-center justify-center gap-2 disabled:opacity-45"
           >
             <FolderOpen className="w-4 h-4" strokeWidth={1.8} />
@@ -263,21 +345,22 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
         )}
 
-        {/* Quiet Backup Utilities */}
-        <div className="pt-3 border-t border-neutral-100 flex items-center justify-end gap-4 text-xs">
+        {/* Full Data Backup & Restore Utilities */}
+        <div className="pt-3 border-t border-neutral-100 flex items-center justify-around gap-4 text-xs">
           <button
             type="button"
-            disabled={personCount === 0}
-            onClick={onExportBackup}
-            className="min-h-[36px] text-neutral-600 hover:text-neutral-950 inline-flex items-center gap-1 disabled:opacity-35"
+            disabled={backupBusy}
+            onClick={() => void handleExportClick()}
+            className="min-h-[40px] px-3 text-neutral-700 hover:text-neutral-950 inline-flex items-center gap-1.5 disabled:opacity-40 whitespace-nowrap"
           >
             <Download className="w-3.5 h-3.5" />
             <span>导出备份</span>
           </button>
           <button
             type="button"
-            onClick={() => backupInputRef.current?.click()}
-            className="min-h-[36px] text-neutral-600 hover:text-neutral-950 inline-flex items-center gap-1"
+            disabled={backupBusy}
+            onClick={() => void handleRestoreClick()}
+            className="min-h-[40px] px-3 text-neutral-700 hover:text-neutral-950 inline-flex items-center gap-1.5 disabled:opacity-40 whitespace-nowrap"
           >
             <Upload className="w-3.5 h-3.5" />
             <span>恢复备份</span>
@@ -286,14 +369,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             ref={backupInputRef}
             type="file"
             accept="application/json,.json"
-            onChange={handleBackupFile}
+            onChange={handleBackupInputFallback}
             className="hidden"
           />
         </div>
 
         {backupNotice && (
           <div
-            className={`text-xs px-3 py-2 rounded-xl border ${
+            className={`text-xs px-3 py-2.5 rounded-xl border leading-relaxed ${
               backupNotice.type === 'ok'
                 ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
                 : 'bg-amber-50 border-amber-200 text-amber-800'
@@ -309,18 +392,18 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         aria-label="匹配相似度设置"
         className="bg-white rounded-2xl border border-neutral-200/90 p-5 space-y-4"
       >
-        <div className="flex items-baseline justify-between gap-2">
-          <div>
+        <div className="space-y-1.5">
+          <div className="flex items-baseline justify-between gap-2">
             <h2 className="text-base font-semibold text-neutral-950">
               匹配相似度
             </h2>
-            <p className="text-xs text-neutral-500 mt-0.5">
-              达到该相似度即显示人物姓名，数值越大越严格
-            </p>
+            <span className="text-base font-semibold font-mono text-neutral-950 tabular-nums shrink-0">
+              ≥ {minSimilarity}%
+            </span>
           </div>
-          <span className="text-base font-semibold font-mono text-neutral-950 tabular-nums shrink-0">
-            ≥ {minSimilarity}%
-          </span>
+          <p className="text-xs text-neutral-500 leading-relaxed">
+            数值越小，匹配越宽松，越容易认出，但也容易认错；数值越大，匹配越严格，越不容易认出，但也不容易认错。
+          </p>
         </div>
 
         {/* 3 Preset Tiers */}
@@ -349,8 +432,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           })}
         </div>
 
-        {/* Precision Slider + +/- 1% Stepper + Exact Input */}
-        <div className="space-y-3 pt-1">
+        {/* Precision Slider + +/- 1% Stepper */}
+        <div className="pt-1">
           <div className="flex items-center gap-2.5">
             <button
               type="button"

@@ -18,6 +18,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   build-apk:
@@ -66,10 +67,43 @@ jobs:
           fi
           npx cap sync android
 
-      - name: 注入相机权限并递增版本号
+      - name: 计算版本号并注入权限与原生插件
         env:
-          ANDROID_VERSION_CODE: ${{ github.run_number }}
-        run: node scripts/prepare-android.mjs manifest
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          CURRENT_YEAR=$(TZ=Asia/Shanghai date +%Y)
+          MAJOR=$((CURRENT_YEAR - 2025))
+          if [ "$MAJOR" -lt 1 ]; then MAJOR=1; fi
+
+          PREV_YEAR=$((CURRENT_YEAR - 1))
+          YEAR_START_UTC="${PREV_YEAR}-12-31T16:00:00Z"
+
+          API_URL="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/build-android-apk.yml/runs"
+          YEAR_RUNS=$(curl -fsSL --get \
+            --data-urlencode "created=>=${YEAR_START_UTC}" \
+            --data-urlencode "per_page=1" \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "$API_URL" | node -e "const d = JSON.parse(require('fs').readFileSync(0,'utf8')); console.log(Number(d.total_count) || 0);" 2>/dev/null || echo "0")
+
+          if [ "$YEAR_RUNS" -gt 0 ] 2>/dev/null; then
+            MINOR="$YEAR_RUNS"
+          else
+            MINOR="${GITHUB_RUN_NUMBER:-1}"
+          fi
+
+          VERSION_NAME="${MAJOR}.${MINOR}"
+          VERSION_CODE=$((MAJOR * 100000 + MINOR))
+
+          echo "ANDROID_VERSION_NAME=${VERSION_NAME}" >> "$GITHUB_ENV"
+          echo "ANDROID_VERSION_MINOR=${MINOR}" >> "$GITHUB_ENV"
+          echo "ANDROID_VERSION_CODE=${VERSION_CODE}" >> "$GITHUB_ENV"
+          echo "Computed Android version: v${VERSION_NAME} (versionCode=${VERSION_CODE})"
+
+          ANDROID_VERSION_NAME="$VERSION_NAME" \
+          ANDROID_VERSION_MINOR="$MINOR" \
+          ANDROID_VERSION_CODE="$VERSION_CODE" \
+          node scripts/prepare-android.mjs manifest
 
       - name: 编译并签名 Android APK
         env:
@@ -84,9 +118,10 @@ jobs:
 
           if [ "$BUILD_TYPE" = "debug" ]; then
             (cd android && ./gradlew assembleDebug --no-daemon)
-            cp android/app/build/outputs/apk/debug/app-debug.apk release/mianpushiren-debug.apk
-            echo "APK_PATH=release/mianpushiren-debug.apk" >> "$GITHUB_ENV"
-            echo "ARTIFACT_NAME=mianpushiren-android-debug-apk" >> "$GITHUB_ENV"
+            OUT_APK="release/renlian-v${ANDROID_VERSION_NAME}-debug.apk"
+            cp android/app/build/outputs/apk/debug/app-debug.apk "$OUT_APK"
+            echo "APK_PATH=${OUT_APK}" >> "$GITHUB_ENV"
+            echo "ARTIFACT_NAME=renlian-v${ANDROID_VERSION_NAME}-debug-apk" >> "$GITHUB_ENV"
           else
             (cd android && ./gradlew assembleRelease --no-daemon)
 
@@ -98,7 +133,7 @@ jobs:
             BUILD_TOOLS_DIR="$(ls -d "$ANDROID_HOME/build-tools"/* | sort -V | tail -n 1)"
             echo "Using Android build-tools: $BUILD_TOOLS_DIR"
 
-            "$BUILD_TOOLS_DIR/zipalign" -f -p 4 "$UNSIGNED_APK" /tmp/mianpushiren-aligned.apk
+            "$BUILD_TOOLS_DIR/zipalign" -f -p 4 "$UNSIGNED_APK" /tmp/renlian-aligned.apk
 
             KEYSTORE_FILE="/tmp/release-signing.jks"
             if [ -n "$KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ]; then
@@ -111,29 +146,30 @@ jobs:
               echo "No custom keystore secrets detected; generating temporary signing key for installable Release APK."
               STORE_PASS="$(openssl rand -hex 16)"
               ALIAS_PASS="$STORE_PASS"
-              ALIAS_NAME="mianpushiren"
+              ALIAS_NAME="renlian"
               keytool -genkeypair -v \
                 -keystore "$KEYSTORE_FILE" \
                 -alias "$ALIAS_NAME" \
                 -keyalg RSA -keysize 2048 -validity 10000 \
                 -storepass "$STORE_PASS" \
                 -keypass "$ALIAS_PASS" \
-                -dname "CN=MianPuShiRen, OU=Mobile, O=MianPuShiRen, L=Shanghai, S=Shanghai, C=CN"
+                -dname "CN=RenLian, OU=Mobile, O=RenLian, L=Shanghai, S=Shanghai, C=CN"
             fi
 
+            OUT_APK="release/renlian-v${ANDROID_VERSION_NAME}-release.apk"
             "$BUILD_TOOLS_DIR/apksigner" sign \
               --ks "$KEYSTORE_FILE" \
               --ks-key-alias "$ALIAS_NAME" \
               --ks-pass "pass:$STORE_PASS" \
               --key-pass "pass:$ALIAS_PASS" \
-              --out release/mianpushiren-release.apk \
-              /tmp/mianpushiren-aligned.apk
+              --out "$OUT_APK" \
+              /tmp/renlian-aligned.apk
 
-            "$BUILD_TOOLS_DIR/apksigner" verify release/mianpushiren-release.apk
-            rm -f "$KEYSTORE_FILE" /tmp/mianpushiren-aligned.apk
+            "$BUILD_TOOLS_DIR/apksigner" verify "$OUT_APK"
+            rm -f "$KEYSTORE_FILE" /tmp/renlian-aligned.apk
 
-            echo "APK_PATH=release/mianpushiren-release.apk" >> "$GITHUB_ENV"
-            echo "ARTIFACT_NAME=mianpushiren-android-release-apk" >> "$GITHUB_ENV"
+            echo "APK_PATH=${OUT_APK}" >> "$GITHUB_ENV"
+            echo "ARTIFACT_NAME=renlian-v${ANDROID_VERSION_NAME}-release-apk" >> "$GITHUB_ENV"
           fi
 
           ls -lh release/

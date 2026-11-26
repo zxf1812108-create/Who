@@ -1,4 +1,4 @@
-import type { PersonRecord } from '../types/face';
+import type { AppSettingsData, PersonRecord } from '../types/face';
 
 const DB_NAME = 'FaceRosterAndroidDB';
 const DB_VERSION = 1;
@@ -91,6 +91,20 @@ export async function putPersonsBatch(persons: PersonRecord[]): Promise<void> {
   });
 }
 
+export async function replaceAllPersons(persons: PersonRecord[]): Promise<void> {
+  const db = await openDatabase();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_PERSONS, 'readwrite');
+    const store = tx.objectStore(STORE_PERSONS);
+    store.clear();
+    for (const person of persons) {
+      store.put(person);
+    }
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
 export async function deletePersonById(id: string): Promise<void> {
   const db = await openDatabase();
   return new Promise((resolve, reject) => {
@@ -101,25 +115,48 @@ export async function deletePersonById(id: string): Promise<void> {
   });
 }
 
-export interface BackupPayload {
-  schema: 'face-roster-backup-v1';
+export interface FullBackupPayload {
+  schema: 'face-roster-backup-v2';
   exportedAt: number;
+  settings: AppSettingsData;
   persons: PersonRecord[];
 }
 
-export function serializeBackup(persons: PersonRecord[]): string {
-  const payload: BackupPayload = {
-    schema: 'face-roster-backup-v1',
-    exportedAt: Date.now(),
-    persons,
-  };
-  return JSON.stringify(payload, null, 2);
+export interface ParsedBackupData {
+  persons: PersonRecord[];
+  settings?: Partial<AppSettingsData>;
+  exportedAt?: number;
 }
 
-export function parseBackupJson(rawText: string): PersonRecord[] {
-  const parsed = JSON.parse(rawText) as Partial<BackupPayload>;
+export function serializeFullBackup(
+  persons: PersonRecord[],
+  settings: AppSettingsData
+): string {
+  const payload: FullBackupPayload = {
+    schema: 'face-roster-backup-v2',
+    exportedAt: Date.now(),
+    settings,
+    persons: persons.map((p) => ({
+      ...p,
+      samples: p.samples.map((s) => ({
+        ...s,
+        originalPhoto: s.originalPhoto || s.thumbnail,
+      })),
+    })),
+  };
+  return JSON.stringify(payload);
+}
+
+export function parseFullBackupJson(rawText: string): ParsedBackupData {
+  const parsed = JSON.parse(rawText) as {
+    schema?: string;
+    exportedAt?: number;
+    settings?: Partial<AppSettingsData>;
+    persons?: PersonRecord[];
+  };
+
   if (!parsed || !Array.isArray(parsed.persons)) {
-    throw new Error('备份文件格式无效，未找到人物特征数据');
+    throw new Error('备份文件格式无效，未找到有效备份数据');
   }
 
   const validPersons: PersonRecord[] = [];
@@ -130,14 +167,28 @@ export function parseBackupJson(rawText: string): PersonRecord[] {
       typeof item.name === 'string' &&
       Array.isArray(item.samples)
     ) {
-      const validSamples = item.samples.filter(
-        (s) =>
-          s &&
-          typeof s.id === 'string' &&
-          Array.isArray(s.descriptor) &&
-          s.descriptor.length === 128 &&
-          typeof s.thumbnail === 'string'
-      );
+      const validSamples = item.samples
+        .filter(
+          (s) =>
+            s &&
+            typeof s.id === 'string' &&
+            Array.isArray(s.descriptor) &&
+            s.descriptor.length === 128 &&
+            typeof s.thumbnail === 'string'
+        )
+        .map((s) => ({
+          id: s.id,
+          descriptor: s.descriptor,
+          thumbnail: s.thumbnail,
+          originalPhoto:
+            typeof s.originalPhoto === 'string' ? s.originalPhoto : s.thumbnail,
+          sourceFilename:
+            typeof s.sourceFilename === 'string' ? s.sourceFilename : `${item.name}.jpg`,
+          detectionScore:
+            typeof s.detectionScore === 'number' ? s.detectionScore : 0.95,
+          createdAt: typeof s.createdAt === 'number' ? s.createdAt : Date.now(),
+        }));
+
       if (validSamples.length > 0) {
         validPersons.push({
           id: item.id,
@@ -152,8 +203,27 @@ export function parseBackupJson(rawText: string): PersonRecord[] {
     }
   }
 
-  if (validPersons.length === 0) {
-    throw new Error('备份文件中没有有效的人脸特征记录');
+  const parsedSettings: Partial<AppSettingsData> | undefined =
+    parsed.settings && typeof parsed.settings === 'object'
+      ? {
+          minSimilarity:
+            typeof parsed.settings.minSimilarity === 'number'
+              ? Math.max(40, Math.min(85, Math.round(parsed.settings.minSimilarity)))
+              : undefined,
+          mergeIndexedSuffixes:
+            typeof parsed.settings.mergeIndexedSuffixes === 'boolean'
+              ? parsed.settings.mergeIndexedSuffixes
+              : undefined,
+        }
+      : undefined;
+
+  if (validPersons.length === 0 && !parsedSettings) {
+    throw new Error('备份文件中没有有效的人物数据或设置');
   }
-  return validPersons;
+
+  return {
+    persons: sortPersonsList(validPersons),
+    settings: parsedSettings,
+    exportedAt: typeof parsed.exportedAt === 'number' ? parsed.exportedAt : undefined,
+  };
 }

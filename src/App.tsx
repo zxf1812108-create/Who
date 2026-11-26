@@ -23,12 +23,15 @@ import {
 import {
   deletePersonById,
   getAllPersons,
-  parseBackupJson,
+  parseFullBackupJson,
   putPerson,
   putPersonsBatch,
-  serializeBackup,
+  replaceAllPersons,
+  serializeFullBackup,
   sortPersonsList,
 } from './services/faceDb';
+import type { ImportableImageSource } from './services/nativeStorage';
+import { exportBackupToChosenFolder } from './services/nativeStorage';
 import { CameraRecognizeView } from './components/CameraRecognizeView';
 import { AlbumView } from './components/AlbumView';
 import { SettingsView } from './components/SettingsView';
@@ -65,15 +68,33 @@ export default function App() {
     return 60;
   });
 
+  const [mergeIndexedSuffixes, setMergeIndexedSuffixes] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem('face_roster_merge_suffixes');
+      if (saved === 'false') return false;
+    } catch {
+      // Ignore storage access errors
+    }
+    return true;
+  });
+
   const [importQueue, setImportQueue] = useState<ImportQueueItem[]>([]);
   const [isImporting, setIsImporting] = useState(false);
-  const [mergeIndexedSuffixes, setMergeIndexedSuffixes] = useState(true);
 
   const handleChangeMinSimilarity = useCallback((value: number) => {
     const clamped = Math.max(40, Math.min(85, Math.round(value)));
     setMinSimilarity(clamped);
     try {
       localStorage.setItem('face_roster_min_similarity', String(clamped));
+    } catch {
+      // Ignore storage access errors
+    }
+  }, []);
+
+  const handleToggleMergeSuffixes = useCallback((val: boolean) => {
+    setMergeIndexedSuffixes(val);
+    try {
+      localStorage.setItem('face_roster_merge_suffixes', String(val));
     } catch {
       // Ignore storage access errors
     }
@@ -187,15 +208,15 @@ export default function App() {
     []
   );
 
-  const handleBatchImportFiles = useCallback(
-    async (files: File[]) => {
-      if (files.length === 0 || engineState.status !== 'ready') return;
+  const handleBatchImportSources = useCallback(
+    async (sources: ImportableImageSource[]) => {
+      if (sources.length === 0 || engineState.status !== 'ready') return;
 
       setIsImporting(true);
-      const initialItems: ImportQueueItem[] = files.map((file, idx) => ({
+      const initialItems: ImportQueueItem[] = sources.map((src, idx) => ({
         id: `q-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 6)}`,
-        filename: file.name,
-        parsedName: parsePersonNameFromFilename(file.name, mergeIndexedSuffixes),
+        filename: src.name,
+        parsedName: parsePersonNameFromFilename(src.name, mergeIndexedSuffixes),
         status: 'pending',
       }));
 
@@ -203,8 +224,8 @@ export default function App() {
 
       let workingPersons = await getAllPersons();
 
-      for (let i = 0; i < files.length; i++) {
-        const file = files[i];
+      for (let i = 0; i < sources.length; i++) {
+        const src = sources[i];
         const itemId = initialItems[i].id;
         const parsedName = initialItems[i].parsedName;
 
@@ -215,7 +236,7 @@ export default function App() {
         );
 
         try {
-          const dataUrl = await readFileAsDataUrl(file);
+          const dataUrl = await src.loadDataUrl();
           const img = await loadImageElement(dataUrl);
           const extracted = await extractPrimaryFaceFromImage(img);
 
@@ -238,7 +259,8 @@ export default function App() {
             id: `sample-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
             descriptor: extracted.descriptor,
             thumbnail: extracted.thumbnail,
-            sourceFilename: file.name,
+            originalPhoto: extracted.originalPhoto,
+            sourceFilename: src.name,
             detectionScore: extracted.detectionScore,
             createdAt: Date.now(),
           };
@@ -287,18 +309,31 @@ export default function App() {
     [engineState.status, mergeIndexedSuffixes, upsertPersonSample]
   );
 
+  const handleBatchImportFiles = useCallback(
+    async (files: File[]) => {
+      const sources: ImportableImageSource[] = files.map((file) => ({
+        name: file.name,
+        loadDataUrl: () => readFileAsDataUrl(file),
+      }));
+      await handleBatchImportSources(sources);
+    },
+    [handleBatchImportSources]
+  );
+
   const handleQuickRegisterFace = useCallback(
     async (
       name: string,
       note: string,
       descriptor: number[],
-      thumbnail: string
+      thumbnail: string,
+      originalPhoto?: string
     ): Promise<PersonRecord> => {
       const current = await getAllPersons();
       const sample: FaceSample = {
         id: `sample-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
         descriptor,
         thumbnail,
+        originalPhoto: originalPhoto || thumbnail,
         sourceFilename: `${name.trim()}_实拍.jpg`,
         detectionScore: 0.99,
         createdAt: Date.now(),
@@ -386,6 +421,7 @@ export default function App() {
           id: `sample-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
           descriptor: extracted.descriptor,
           thumbnail: extracted.thumbnail,
+          originalPhoto: extracted.originalPhoto,
           sourceFilename: file.name,
           detectionScore: extracted.detectionScore,
           createdAt: Date.now(),
@@ -431,52 +467,46 @@ export default function App() {
     setPersons((prev) => prev.filter((p) => p.id !== personId));
   }, []);
 
-  const handleExportBackup = useCallback(() => {
-    const json = serializeBackup(persons);
-    const blob = new Blob([json], { type: 'application/json;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
+  const handleExportFullBackup = useCallback(async () => {
+    const latestPersons = await getAllPersons();
+    const content = serializeFullBackup(latestPersons, {
+      minSimilarity,
+      mergeIndexedSuffixes,
+    });
     const stamp = new Date().toISOString().slice(0, 10);
-    link.href = url;
-    link.download = `面谱识人特征库_${stamp}.json`;
-    link.click();
-    URL.revokeObjectURL(url);
-  }, [persons]);
+    const filename = `认脸完整备份_${stamp}.json`;
+    return exportBackupToChosenFolder(filename, content);
+  }, [minSimilarity, mergeIndexedSuffixes]);
 
-  const handleImportBackup = useCallback(
-    async (file: File): Promise<{ ok: boolean; message: string }> => {
+  const handleImportFullBackupContent = useCallback(
+    async (rawJson: string): Promise<{ ok: boolean; message: string }> => {
       try {
-        const text = await file.text();
-        const restored = parseBackupJson(text);
-        let working = await getAllPersons();
+        const parsed = parseFullBackupJson(rawJson);
 
-        for (const incoming of restored) {
-          const idx = working.findIndex(
-            (p) =>
-              p.name.trim().toLowerCase() === incoming.name.trim().toLowerCase()
-          );
-          if (idx >= 0) {
-            const mergedSamples = [...incoming.samples, ...working[idx].samples];
-            const dedupMap = new Map(mergedSamples.map((s) => [s.id, s]));
-            const mergedPerson: PersonRecord = {
-              ...working[idx],
-              note: working[idx].note || incoming.note,
-              samples: Array.from(dedupMap.values()),
-              updatedAt: Date.now(),
-            };
-            await putPerson(mergedPerson);
-            working[idx] = mergedPerson;
-          } else {
-            await putPerson(incoming);
-            working = [...working, incoming];
+        // Restore full person database (photos, 128D features, custom sort order)
+        if (parsed.persons.length > 0) {
+          await replaceAllPersons(parsed.persons);
+          const refreshed = await getAllPersons();
+          setPersons(refreshed);
+        }
+
+        // Restore all saved application settings
+        if (parsed.settings) {
+          if (typeof parsed.settings.minSimilarity === 'number') {
+            handleChangeMinSimilarity(parsed.settings.minSimilarity);
+          }
+          if (typeof parsed.settings.mergeIndexedSuffixes === 'boolean') {
+            handleToggleMergeSuffixes(parsed.settings.mergeIndexedSuffixes);
           }
         }
 
-        const refreshed = await getAllPersons();
-        setPersons(refreshed);
+        const photoCount = parsed.persons.reduce(
+          (sum, p) => sum + p.samples.length,
+          0
+        );
         return {
           ok: true,
-          message: `已恢复 ${restored.length} 位人物的特征数据`,
+          message: `已恢复完整备份：${parsed.persons.length} 位人物（${photoCount} 张照片与特征）及软件设置`,
         };
       } catch (err) {
         return {
@@ -485,14 +515,14 @@ export default function App() {
         };
       }
     },
-    []
+    [handleChangeMinSimilarity, handleToggleMergeSuffixes]
   );
 
   return (
     <div className="min-h-screen flex flex-col bg-[#F8F8F7] text-[#141413]">
-      {/* Subtle Engine Status Notice (Only while loading or on error) */}
+      {/* Subtle Engine Status Notice (Respects safe-area top inset) */}
       {engineState.status === 'loading' && (
-        <div className="max-w-4xl w-full mx-auto px-4 pt-3">
+        <div className="max-w-4xl w-full mx-auto px-4 pt-safe">
           <div className="bg-white border border-neutral-200/90 rounded-xl px-3.5 py-2.5 flex items-center gap-2.5 text-xs text-neutral-600">
             <Loader2 className="w-3.5 h-3.5 text-neutral-800 animate-spin shrink-0" />
             <span className="truncate">{engineState.progressText}</span>
@@ -501,7 +531,7 @@ export default function App() {
       )}
 
       {engineState.status === 'error' && (
-        <div className="max-w-4xl w-full mx-auto px-4 pt-3">
+        <div className="max-w-4xl w-full mx-auto px-4 pt-safe">
           <div className="bg-amber-50 border border-amber-200 rounded-xl px-3.5 py-2.5 flex items-center justify-between gap-3 text-xs text-amber-900">
             <div className="flex items-center gap-2 min-w-0">
               <AlertCircle className="w-4 h-4 shrink-0" />
@@ -521,7 +551,11 @@ export default function App() {
       )}
 
       {/* Main Content Above Bottom Minimalist Toolbar */}
-      <main className="flex-1 max-w-4xl w-full mx-auto px-4 sm:px-6 pt-4 pb-24">
+      <main
+        className={`flex-1 max-w-4xl w-full mx-auto px-4 sm:px-6 pb-24 ${
+          engineState.status === 'ready' ? 'pt-safe' : 'pt-3'
+        }`}
+      >
         {activeTab === 'camera' && (
           <CameraRecognizeView
             persons={persons}
@@ -554,12 +588,13 @@ export default function App() {
             isImporting={isImporting}
             mergeIndexedSuffixes={mergeIndexedSuffixes}
             minSimilarity={minSimilarity}
-            onToggleMergeSuffixes={setMergeIndexedSuffixes}
-            onImportFiles={(files) => handleBatchImportFiles(files)}
+            onToggleMergeSuffixes={handleToggleMergeSuffixes}
+            onImportFiles={handleBatchImportFiles}
+            onImportSources={handleBatchImportSources}
             onClearQueue={() => setImportQueue([])}
             onChangeMinSimilarity={handleChangeMinSimilarity}
-            onExportBackup={handleExportBackup}
-            onImportBackup={handleImportBackup}
+            onExportBackup={handleExportFullBackup}
+            onImportBackupContent={handleImportFullBackupContent}
           />
         )}
       </main>

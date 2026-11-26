@@ -4,6 +4,8 @@ export interface FaceSample {
   descriptor: number[];
   /** Cropped face thumbnail as compressed JPEG data URL */
   thumbnail: string;
+  /** Compressed original full portrait photo for complete archival & backup */
+  originalPhoto?: string;
   /** Original imported filename */
   sourceFilename: string;
   /** Face detection confidence score (0 - 1) */
@@ -20,6 +22,11 @@ export interface PersonRecord {
   sortOrder?: number;
   createdAt: number;
   updatedAt: number;
+}
+
+export interface AppSettingsData {
+  minSimilarity: number;
+  mergeIndexedSuffixes: boolean;
 }
 
 export interface NormalizedBox {
@@ -47,7 +54,7 @@ export interface RecognizedFace {
   /** 128D descriptor for registering unknown faces directly */
   descriptor: number[];
   detectionScore: number;
-  /** Matched person if best distance <= threshold, otherwise null */
+  /** Matched person if best similarity >= minSimilarity, otherwise null */
   matchedPerson: CandidateMatch | null;
   /** Top 3 closest candidates regardless of threshold */
   topCandidates: CandidateMatch[];

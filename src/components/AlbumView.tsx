@@ -1,7 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Check,
-  GripHorizontal,
   ImagePlus,
   Loader2,
   RotateCcw,
@@ -11,7 +10,6 @@ import {
   X,
 } from 'lucide-react';
 import type { EngineState, PersonRecord } from '../types/face';
-import { VectorBarcode } from './VectorBarcode';
 
 interface AlbumViewProps {
   persons: PersonRecord[];
@@ -202,28 +200,28 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
       }, 60);
     };
 
+    const handleTouchMove = (e: TouchEvent) => {
+      if (dragSessionRef.current?.active && e.cancelable) {
+        e.preventDefault();
+      }
+    };
+
     window.addEventListener('pointermove', handlePointerMove, { passive: false });
+    window.addEventListener('touchmove', handleTouchMove, { passive: false });
     window.addEventListener('pointerup', finishDrag);
     window.addEventListener('pointercancel', finishDrag);
 
     return () => {
       window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('touchmove', handleTouchMove);
       window.removeEventListener('pointerup', finishDrag);
       window.removeEventListener('pointercancel', finishDrag);
     };
   }, [onReorderPersons]);
 
-  const startCardPointer = (
-    e: React.PointerEvent,
-    personId: string,
-    immediate: boolean
-  ) => {
+  const startCardPointer = (e: React.PointerEvent, personId: string) => {
     if (isSearching || persons.length < 2) return;
     if (e.pointerType === 'mouse' && e.button !== 0) return;
-
-    if (immediate) {
-      e.stopPropagation();
-    }
 
     const session = {
       personId,
@@ -236,15 +234,8 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
     };
     dragSessionRef.current = session;
 
-    if (immediate) {
-      session.active = true;
-      suppressNextClickRef.current = true;
-      const initialIds = persons.map((p) => p.id);
-      draftOrderRef.current = initialIds;
-      setDraftOrderIds(initialIds);
-      setDraggingId(personId);
-    } else if (e.pointerType !== 'mouse') {
-      // Touch long-press anywhere on card activates drag while keeping scrolling smooth
+    if (e.pointerType !== 'mouse') {
+      // Hold photo to start dragging while preserving normal vertical scroll
       session.longPressTimer = window.setTimeout(() => {
         const cur = dragSessionRef.current;
         if (cur && cur.personId === personId && !cur.active) {
@@ -254,6 +245,13 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
           draftOrderRef.current = initialIds;
           setDraftOrderIds(initialIds);
           setDraggingId(personId);
+          if (typeof navigator !== 'undefined' && 'vibrate' in navigator) {
+            try {
+              navigator.vibrate(15);
+            } catch {
+              // Ignore vibration restrictions
+            }
+          }
         }
       }, 220);
     }
@@ -329,8 +327,8 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
                   {saveToast
                     ? '已自动保存排序'
                     : hasCustomOrder
-                      ? '自定义拖动排序'
-                      : '按姓名排序 · 可拖动调整'}
+                      ? '按住照片可拖动排序'
+                      : '按姓名排序 · 按住照片可拖动'}
                 </span>
               </>
             )}
@@ -360,7 +358,7 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
               暂无人物照片
             </p>
             <p className="text-xs text-neutral-500">
-              导入人物照片后将在此显示全部人物档案
+              请到设置界面导入照片。
             </p>
           </div>
         </div>
@@ -385,7 +383,8 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
               <div
                 key={person.id}
                 data-person-id={person.id}
-                onPointerDown={(e) => startCardPointer(e, person.id, false)}
+                onPointerDown={(e) => startCardPointer(e, person.id)}
+                onContextMenu={(e) => e.preventDefault()}
                 onClick={() => {
                   if (suppressNextClickRef.current) return;
                   openPersonSheet(person);
@@ -398,9 +397,9 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
                     openPersonSheet(person);
                   }
                 }}
-                className={`group relative bg-white rounded-2xl border overflow-hidden cursor-pointer transition-transform duration-150 focus-visible:outline-2 focus-visible:outline-neutral-900 ${
+                className={`group relative bg-white rounded-2xl border overflow-hidden cursor-pointer select-none transition-transform duration-150 focus-visible:outline-2 focus-visible:outline-neutral-900 ${
                   isDragging
-                    ? 'scale-[1.03] opacity-75 border-neutral-900 ring-2 ring-neutral-900/15 z-10'
+                    ? 'touch-none scale-[1.03] opacity-80 border-neutral-900 ring-2 ring-neutral-900/15 shadow-lg z-10'
                     : 'border-neutral-200/90 hover:border-neutral-300'
                 }`}
               >
@@ -416,19 +415,6 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
                   ) : (
                     <div className="w-full h-full flex items-center justify-center text-neutral-400 text-xl font-medium">
                       {person.name.slice(0, 1)}
-                    </div>
-                  )}
-
-                  {/* Tactile Drag Handle for Instant Touch Reordering */}
-                  {!isSearching && persons.length > 1 && (
-                    <div
-                      onPointerDown={(e) => startCardPointer(e, person.id, true)}
-                      onClick={(e) => e.stopPropagation()}
-                      aria-label={`拖动调整 ${person.name} 的排序`}
-                      title="按住拖动排序"
-                      className="touch-none absolute top-2 right-2 w-8 h-8 rounded-full bg-black/35 backdrop-blur-xs text-white/90 flex items-center justify-center cursor-grab active:cursor-grabbing opacity-80 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity"
-                    >
-                      <GripHorizontal className="w-4 h-4" />
                     </div>
                   )}
                 </div>
@@ -461,26 +447,64 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
               <div className="w-9 h-1 rounded-full bg-neutral-300" />
             </div>
 
-            <div className="px-5 py-3.5 border-b border-neutral-100 flex items-center justify-between gap-3">
-              <div className="min-w-0">
-                <h2 className="text-base font-semibold text-neutral-950 truncate">
-                  {selectedPerson.name}
-                </h2>
-                <p className="text-xs text-neutral-500 tabular-nums">
-                  {selectedPerson.samples.length} 组面部特征模板
-                </p>
-              </div>
+            {/* Compact Title Bar: Left = Delete, Center = Name, Right = Close */}
+            <div className="px-4 py-3 border-b border-neutral-100 grid grid-cols-[auto_1fr_auto] items-center gap-2">
+              <button
+                type="button"
+                onClick={() =>
+                  setConfirmDeleteId((cur) =>
+                    cur === selectedPerson.id ? null : selectedPerson.id
+                  )
+                }
+                aria-label="删除该人物"
+                className="min-h-[40px] px-2.5 rounded-xl text-red-600 hover:bg-red-50 text-xs font-medium inline-flex items-center gap-1 transition-colors"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>删除</span>
+              </button>
+
+              <h2 className="text-base font-semibold text-neutral-950 text-center truncate px-1">
+                {selectedPerson.name}
+              </h2>
+
               <button
                 type="button"
                 onClick={closePersonSheet}
-                aria-label="关闭详情"
-                className="min-h-[42px] min-w-[42px] flex items-center justify-center rounded-xl text-neutral-500 hover:bg-neutral-100"
+                aria-label="关闭"
+                className="min-h-[40px] min-w-[40px] flex items-center justify-center rounded-xl text-neutral-500 hover:bg-neutral-100 transition-colors"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
 
             <div className="p-5 overflow-y-auto space-y-5">
+              {confirmDeleteId === selectedPerson.id && (
+                <div className="flex items-center justify-between gap-3 bg-red-50 border border-red-200 rounded-xl px-3.5 py-2.5">
+                  <span className="text-xs text-red-800">
+                    确定删除「{selectedPerson.name}」及全部照片？
+                  </span>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => setConfirmDeleteId(null)}
+                      className="min-h-[34px] px-2.5 rounded-lg bg-white border border-neutral-200 text-xs text-neutral-700"
+                    >
+                      取消
+                    </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        await onDeletePerson(selectedPerson.id);
+                        closePersonSheet();
+                      }}
+                      className="min-h-[34px] px-2.5 rounded-lg bg-red-600 text-white text-xs font-medium"
+                    >
+                      确认删除
+                    </button>
+                  </div>
+                </div>
+              )}
+
               {detailNotice && (
                 <div
                   className={`text-xs px-3.5 py-2.5 rounded-xl border ${
@@ -529,10 +553,15 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
               </form>
 
               <div className="space-y-3 pt-4 border-t border-neutral-100">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-xs font-medium text-neutral-700">
-                    已录入的人脸照片（多角度可提升识别率）
-                  </span>
+                <div className="flex items-start justify-between gap-2">
+                  <div className="space-y-0.5">
+                    <div className="text-xs font-medium text-neutral-700">
+                      已录入的人脸照片
+                    </div>
+                    <div className="text-xs text-neutral-400">
+                      多角度可提升识别率
+                    </div>
+                  </div>
                   <button
                     type="button"
                     disabled={engineState.status !== 'ready' || addingSample}
@@ -584,53 +613,6 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
                     </div>
                   ))}
                 </div>
-              </div>
-
-              {selectedPerson.samples[0] && (
-                <div className="space-y-2 pt-4 border-t border-neutral-100">
-                  <span className="text-xs font-medium text-neutral-700">
-                    128 维特征向量分布
-                  </span>
-                  <VectorBarcode descriptor={selectedPerson.samples[0].descriptor} />
-                </div>
-              )}
-
-              <div className="pt-4 border-t border-neutral-100">
-                {confirmDeleteId === selectedPerson.id ? (
-                  <div className="flex items-center justify-between gap-3 bg-red-50 border border-red-200 rounded-xl px-3.5 py-2.5">
-                    <span className="text-xs text-red-800">
-                      确定删除「{selectedPerson.name}」及特征数据？
-                    </span>
-                    <div className="flex items-center gap-2 shrink-0">
-                      <button
-                        type="button"
-                        onClick={() => setConfirmDeleteId(null)}
-                        className="min-h-[34px] px-2.5 rounded-lg bg-white border border-neutral-200 text-xs text-neutral-700"
-                      >
-                        取消
-                      </button>
-                      <button
-                        type="button"
-                        onClick={async () => {
-                          await onDeletePerson(selectedPerson.id);
-                          closePersonSheet();
-                        }}
-                        className="min-h-[34px] px-2.5 rounded-lg bg-red-600 text-white text-xs font-medium"
-                      >
-                        删除
-                      </button>
-                    </div>
-                  </div>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={() => setConfirmDeleteId(selectedPerson.id)}
-                    className="min-h-[40px] px-3 py-1.5 rounded-xl text-red-600 hover:bg-red-50 text-xs font-medium inline-flex items-center gap-1.5"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                    <span>删除该人物</span>
-                  </button>
-                )}
               </div>
             </div>
           </div>
