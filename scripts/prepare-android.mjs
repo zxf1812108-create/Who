@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import zlib from 'node:zlib';
 
 const rootDir = process.cwd();
 const mode = process.argv[2] || 'all';
@@ -586,11 +587,468 @@ public class StoragePickerPlugin extends Plugin {
   console.log('[prepare-android] Generated MainActivity.java (with safe display cutout insets) and StoragePickerPlugin.java.');
 }
 
+// ---------------------------------------------------------------------------
+// Minimalist App Icon Renderer (Option 1: #F8F8F7 warm paper + #141413 ink)
+// Pure-Node 4x4 supersampled SDF rasterizer (zero external dependencies)
+// ---------------------------------------------------------------------------
+
+function distPointToSegment(px, py, ax, ay, bx, by) {
+  const vx = bx - ax;
+  const vy = by - ay;
+  const wx = px - ax;
+  const wy = py - ay;
+  const lenSq = vx * vx + vy * vy;
+  let t = lenSq > 0 ? (wx * vx + wy * vy) / lenSq : 0;
+  if (t < 0) t = 0;
+  else if (t > 1) t = 1;
+  const dx = px - (ax + t * vx);
+  const dy = py - (ay + t * vy);
+  return Math.hypot(dx, dy);
+}
+
+function sampleQuadraticBezier(x0, y0, x1, y1, x2, y2, steps = 20) {
+  const pts = [];
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const inv = 1 - t;
+    pts.push([
+      inv * inv * x0 + 2 * inv * t * x1 + t * t * x2,
+      inv * inv * y0 + 2 * inv * t * y1 + t * t * y2,
+    ]);
+  }
+  return pts;
+}
+
+function buildIconStrokes(insetMode) {
+  // Adaptive foreground uses slightly tighter 30..78 coordinates inside 108x108 safe circle;
+  // full square/web icon uses 27..81 inside 108x108 for optimal visual presence.
+  if (insetMode === 'adaptive') {
+    return [
+      // Four viewfinder brackets [30..78]
+      {
+        r: 2.1,
+        pts: [
+          [30, 41],
+          ...sampleQuadraticBezier(30, 36.5, 30, 30, 36.5, 30, 14),
+          [41, 30],
+        ],
+      },
+      {
+        r: 2.1,
+        pts: [
+          [67, 30],
+          ...sampleQuadraticBezier(71.5, 30, 78, 30, 78, 36.5, 14),
+          [78, 41],
+        ],
+      },
+      {
+        r: 2.1,
+        pts: [
+          [78, 67],
+          ...sampleQuadraticBezier(78, 71.5, 78, 78, 71.5, 78, 14),
+          [67, 78],
+        ],
+      },
+      {
+        r: 2.1,
+        pts: [
+          [41, 78],
+          ...sampleQuadraticBezier(36.5, 78, 30, 78, 30, 71.5, 14),
+          [30, 67],
+        ],
+      },
+      // Minimalist face centered at (54, 54)
+      { r: 2.1, pts: [[44.5, 44], [44.5, 48]] },
+      { r: 2.1, pts: [[63.5, 44], [63.5, 48]] },
+      {
+        r: 1.9,
+        pts: [
+          [54, 45],
+          [54, 53],
+          ...sampleQuadraticBezier(54, 53, 54, 55.5, 51.8, 55.5, 10),
+        ],
+      },
+      {
+        r: 2.1,
+        pts: sampleQuadraticBezier(45.5, 61, 54, 67.5, 62.5, 61, 20),
+      },
+    ];
+  }
+
+  return [
+    // Four viewfinder brackets [27..81]
+    {
+      r: 2.3,
+      pts: [
+        [27, 40],
+        ...sampleQuadraticBezier(27, 34.5, 27, 27, 34.5, 27, 14),
+        [40, 27],
+      ],
+    },
+    {
+      r: 2.3,
+      pts: [
+        [68, 27],
+        ...sampleQuadraticBezier(73.5, 27, 81, 27, 81, 34.5, 14),
+        [81, 40],
+      ],
+    },
+    {
+      r: 2.3,
+      pts: [
+        [81, 68],
+        ...sampleQuadraticBezier(81, 73.5, 81, 81, 73.5, 81, 14),
+        [68, 81],
+      ],
+    },
+    {
+      r: 2.3,
+      pts: [
+        [40, 81],
+        ...sampleQuadraticBezier(34.5, 81, 27, 81, 27, 73.5, 14),
+        [27, 68],
+      ],
+    },
+    // Minimalist face centered at (54, 54)
+    { r: 2.3, pts: [[43.5, 43.5], [43.5, 48]] },
+    { r: 2.3, pts: [[64.5, 43.5], [64.5, 48]] },
+    {
+      r: 2.0,
+      pts: [
+        [54, 44.5],
+        [54, 53.2],
+        ...sampleQuadraticBezier(54, 53.2, 54, 56, 51.4, 56, 10),
+      ],
+    },
+    {
+      r: 2.3,
+      pts: sampleQuadraticBezier(44.5, 62.5, 54, 69.5, 63.5, 62.5, 20),
+    },
+  ];
+}
+
+function crc32(buf) {
+  let c = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) {
+    c ^= buf[i];
+    for (let k = 0; k < 8; k++) {
+      c = (c >>> 1) ^ (0xedb88320 & -(c & 1));
+    }
+  }
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type, data) {
+  const typeBuf = Buffer.from(type, 'ascii');
+  const lenBuf = Buffer.alloc(4);
+  lenBuf.writeUInt32BE(data.length, 0);
+  const crcInput = Buffer.concat([typeBuf, data]);
+  const crcBuf = Buffer.alloc(4);
+  crcBuf.writeUInt32BE(crc32(crcInput), 0);
+  return Buffer.concat([lenBuf, typeBuf, data, crcBuf]);
+}
+
+function encodeRgbaPng(width, height, rgba) {
+  const stride = width * 4 + 1;
+  const raw = Buffer.alloc(stride * height);
+  for (let y = 0; y < height; y++) {
+    const rowStart = y * stride;
+    raw[rowStart] = 0; // filter: None
+    rgba.copy(raw, rowStart + 1, y * width * 4, (y + 1) * width * 4);
+  }
+
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 6; // RGBA
+  ihdr[10] = 0;
+  ihdr[11] = 0;
+  ihdr[12] = 0;
+
+  const idat = zlib.deflateSync(raw, { level: 9 });
+  return Buffer.concat([
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', idat),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+/**
+ * Renders the Option 1 icon into an RGBA PNG buffer.
+ * @param {number} size Pixel width & height
+ * @param {'square'|'round'|'foreground'} variant
+ */
+function renderIconPngBuffer(size, variant) {
+  const strokes = buildIconStrokes(variant === 'foreground' ? 'adaptive' : 'full');
+  const bgR = 0xf8;
+  const bgG = 0xf8;
+  const bgB = 0xf7;
+  const fgR = 0x14;
+  const fgG = 0x14;
+  const fgB = 0x13;
+
+  const rgba = Buffer.alloc(size * size * 4);
+  const ss = 3; // 3x3 supersampling per pixel
+  const invSamples = 1 / (ss * ss);
+  const scale = 108 / size;
+
+  for (let py = 0; py < size; py++) {
+    for (let px = 0; px < size; px++) {
+      let fgCov = 0;
+      let bgCov = 0;
+
+      for (let sy = 0; sy < ss; sy++) {
+        for (let sx = 0; sx < ss; sx++) {
+          const ux = (px + (sx + 0.5) / ss) * scale;
+          const uy = (py + (sy + 0.5) / ss) * scale;
+
+          let insideShape = true;
+          if (variant === 'round') {
+            insideShape = Math.hypot(ux - 54, uy - 54) <= 50.5;
+          } else if (variant === 'square') {
+            // Subtle rounded square for legacy launcher & web icon
+            const rx = Math.max(Math.abs(ux - 54) - (52 - 22), 0);
+            const ry = Math.max(Math.abs(uy - 54) - (52 - 22), 0);
+            insideShape = Math.hypot(rx, ry) <= 22;
+          }
+
+          if (variant !== 'foreground' && insideShape) {
+            bgCov += invSamples;
+          }
+
+          let hitStroke = false;
+          for (let i = 0; i < strokes.length; i++) {
+            const st = strokes[i];
+            const pts = st.pts;
+            for (let j = 0; j < pts.length - 1; j++) {
+              const d = distPointToSegment(
+                ux,
+                uy,
+                pts[j][0],
+                pts[j][1],
+                pts[j + 1][0],
+                pts[j + 1][1]
+              );
+              if (d <= st.r) {
+                hitStroke = true;
+                break;
+              }
+            }
+            if (hitStroke) break;
+          }
+
+          if (hitStroke && (variant === 'foreground' || insideShape)) {
+            fgCov += invSamples;
+          }
+        }
+      }
+
+      const idx = (py * size + px) * 4;
+      if (variant === 'foreground') {
+        rgba[idx] = fgR;
+        rgba[idx + 1] = fgG;
+        rgba[idx + 2] = fgB;
+        rgba[idx + 3] = Math.round(fgCov * 255);
+      } else if (bgCov <= 0) {
+        rgba[idx] = 0;
+        rgba[idx + 1] = 0;
+        rgba[idx + 2] = 0;
+        rgba[idx + 3] = 0;
+      } else {
+        const fgRatio = Math.min(1, fgCov / bgCov);
+        rgba[idx] = Math.round(bgR * (1 - fgRatio) + fgR * fgRatio);
+        rgba[idx + 1] = Math.round(bgG * (1 - fgRatio) + fgG * fgRatio);
+        rgba[idx + 2] = Math.round(bgB * (1 - fgRatio) + fgB * fgRatio);
+        rgba[idx + 3] = Math.round(bgCov * 255);
+      }
+    }
+  }
+
+  return encodeRgbaPng(size, size, rgba);
+}
+
+function writeWebIconPng() {
+  const outPath = path.join(rootDir, 'public', 'icon-512.png');
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  fs.writeFileSync(outPath, renderIconPngBuffer(512, 'square'));
+  console.log('[prepare-android] Generated public/icon-512.png.');
+}
+
+function writeAndroidIconsAndSplash() {
+  const resDir = path.join(rootDir, 'android', 'app', 'src', 'main', 'res');
+  if (!fs.existsSync(resDir)) {
+    console.log('[prepare-android] Android res directory not found yet, skipping icon & splash generation.');
+    return;
+  }
+
+  // 1. Adaptive Icon Background Color (#F8F8F7)
+  const valuesDir = path.join(resDir, 'values');
+  fs.mkdirSync(valuesDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(valuesDir, 'ic_launcher_background.xml'),
+    `<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ic_launcher_background">#F8F8F7</color>
+</resources>
+`,
+    'utf8'
+  );
+
+  // 2. Adaptive Icon Crisp Vector Foreground (108dp viewport, 66dp safe-zone compliant)
+  const drawableDir = path.join(resDir, 'drawable');
+  fs.mkdirSync(drawableDir, { recursive: true });
+  const legacyV24Foreground = path.join(resDir, 'drawable-v24', 'ic_launcher_foreground.xml');
+  if (fs.existsSync(legacyV24Foreground)) {
+    fs.unlinkSync(legacyV24Foreground);
+  }
+  fs.writeFileSync(
+    path.join(drawableDir, 'ic_launcher_foreground.xml'),
+    `<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Four camera viewfinder corner brackets -->
+    <path
+        android:pathData="M30,41 L30,36.5 Q30,30 36.5,30 L41,30"
+        android:strokeColor="#141413"
+        android:strokeWidth="4.2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M67,30 L71.5,30 Q78,30 78,36.5 L78,41"
+        android:strokeColor="#141413"
+        android:strokeWidth="4.2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M78,67 L78,71.5 Q78,78 71.5,78 L67,78"
+        android:strokeColor="#141413"
+        android:strokeWidth="4.2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M41,78 L36.5,78 Q30,78 30,71.5 L30,67"
+        android:strokeColor="#141413"
+        android:strokeWidth="4.2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <!-- Minimalist face recognition mark -->
+    <path
+        android:pathData="M44.5,44 L44.5,48"
+        android:strokeColor="#141413"
+        android:strokeWidth="4.2"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M63.5,44 L63.5,48"
+        android:strokeColor="#141413"
+        android:strokeWidth="4.2"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M54,45 L54,53 Q54,55.5 51.8,55.5"
+        android:strokeColor="#141413"
+        android:strokeWidth="3.8"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M45.5,61 Q54,67.5 62.5,61"
+        android:strokeColor="#141413"
+        android:strokeWidth="4.2"
+        android:strokeLineCap="round" />
+</vector>
+`,
+    'utf8'
+  );
+
+  // 3. Adaptive Icon XML (API 26+ & Android 13+ monochrome themed icon)
+  const anydpiDir = path.join(resDir, 'mipmap-anydpi-v26');
+  fs.mkdirSync(anydpiDir, { recursive: true });
+  const adaptiveXml = `<?xml version="1.0" encoding="utf-8"?>
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+    <monochrome android:drawable="@drawable/ic_launcher_foreground" />
+</adaptive-icon>
+`;
+  fs.writeFileSync(path.join(anydpiDir, 'ic_launcher.xml'), adaptiveXml, 'utf8');
+  fs.writeFileSync(path.join(anydpiDir, 'ic_launcher_round.xml'), adaptiveXml, 'utf8');
+
+  // 4. Legacy & APK-installer preview raster PNGs across all mipmap densities
+  const densities = [
+    { dir: 'mipmap-mdpi', iconSize: 48, fgSize: 108 },
+    { dir: 'mipmap-hdpi', iconSize: 72, fgSize: 162 },
+    { dir: 'mipmap-xhdpi', iconSize: 96, fgSize: 216 },
+    { dir: 'mipmap-xxhdpi', iconSize: 144, fgSize: 324 },
+    { dir: 'mipmap-xxxhdpi', iconSize: 192, fgSize: 432 },
+  ];
+
+  for (const d of densities) {
+    const targetDir = path.join(resDir, d.dir);
+    fs.mkdirSync(targetDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(targetDir, 'ic_launcher.png'),
+      renderIconPngBuffer(d.iconSize, 'square')
+    );
+    fs.writeFileSync(
+      path.join(targetDir, 'ic_launcher_round.png'),
+      renderIconPngBuffer(d.iconSize, 'round')
+    );
+    fs.writeFileSync(
+      path.join(targetDir, 'ic_launcher_foreground.png'),
+      renderIconPngBuffer(d.fgSize, 'foreground')
+    );
+  }
+
+  // 5. Replace Capacitor's default blue splash.png with clean warm-white minimalist splash.xml
+  const splashDirs = [
+    'drawable',
+    'drawable-land-mdpi',
+    'drawable-land-hdpi',
+    'drawable-land-xhdpi',
+    'drawable-land-xxhdpi',
+    'drawable-land-xxxhdpi',
+    'drawable-port-mdpi',
+    'drawable-port-hdpi',
+    'drawable-port-xhdpi',
+    'drawable-port-xxhdpi',
+    'drawable-port-xxxhdpi',
+  ];
+  for (const dirName of splashDirs) {
+    const oldSplash = path.join(resDir, dirName, 'splash.png');
+    if (fs.existsSync(oldSplash)) {
+      fs.unlinkSync(oldSplash);
+    }
+  }
+  fs.writeFileSync(
+    path.join(drawableDir, 'splash.xml'),
+    `<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@color/ic_launcher_background" />
+    <item
+        android:width="128dp"
+        android:height="128dp"
+        android:gravity="center"
+        android:drawable="@drawable/ic_launcher_foreground" />
+</layer-list>
+`,
+    'utf8'
+  );
+
+  console.log('[prepare-android] Generated minimalist Option-1 adaptive icons, mipmap PNGs, and warm-white splash screen.');
+}
+
 if (mode === 'models' || mode === 'all') {
   ensureFaceModels();
+}
+if (mode === 'icons' || mode === 'all') {
+  writeWebIconPng();
 }
 if (mode === 'manifest' || mode === 'all') {
   patchAndroidManifest();
   patchAndroidVersionCode();
   writeNativeAndroidSources();
+  writeAndroidIconsAndSplash();
 }
