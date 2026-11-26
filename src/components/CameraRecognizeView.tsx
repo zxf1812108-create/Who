@@ -1,5 +1,5 @@
 import React, { useMemo, useRef, useState } from 'react';
-import { Camera as CameraIcon, Loader2, UserPlus } from 'lucide-react';
+import { Camera as CameraIcon, Loader2 } from 'lucide-react';
 import { Capacitor } from '@capacitor/core';
 import {
   Camera as NativeCamera,
@@ -19,20 +19,12 @@ interface CameraRecognizeViewProps {
   persons: PersonRecord[];
   engineState: EngineState;
   minSimilarity: number;
-  onQuickRegisterFace: (
-    name: string,
-    note: string,
-    descriptor: number[],
-    thumbnail: string,
-    originalPhoto?: string
-  ) => Promise<PersonRecord>;
 }
 
 export const CameraRecognizeView: React.FC<CameraRecognizeViewProps> = ({
   persons,
   engineState,
   minSimilarity,
-  onQuickRegisterFace,
 }) => {
   const webCaptureInputRef = useRef<HTMLInputElement>(null);
 
@@ -43,9 +35,6 @@ export const CameraRecognizeView: React.FC<CameraRecognizeViewProps> = ({
   const [isCapturing, setIsCapturing] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
-
-  const [registerName, setRegisterName] = useState('');
-  const [registering, setRegistering] = useState(false);
 
   // Re-evaluate captured faces immediately whenever library or similarity setting changes
   const evaluatedFaces = useMemo(() => {
@@ -74,7 +63,6 @@ export const CameraRecognizeView: React.FC<CameraRecognizeViewProps> = ({
     setIsAnalyzing(true);
     setAnalysisError(null);
     setHasAttemptedCapture(true);
-    setRegisterName('');
 
     try {
       const img = await loadImageElement(dataUrl);
@@ -144,24 +132,6 @@ export const CameraRecognizeView: React.FC<CameraRecognizeViewProps> = ({
       await analyzeDataUrl(dataUrl);
     } catch (err) {
       setAnalysisError(err instanceof Error ? err.message : '无法读取拍摄照片');
-    }
-  };
-
-  const handleQuickSave = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!activeFace || !registerName.trim()) return;
-    setRegistering(true);
-    try {
-      await onQuickRegisterFace(
-        registerName.trim(),
-        '',
-        activeFace.descriptor,
-        activeFace.cropThumbnail,
-        capturedPhotoUrl ?? undefined
-      );
-      setRegisterName('');
-    } finally {
-      setRegistering(false);
     }
   };
 
@@ -396,44 +366,14 @@ export const CameraRecognizeView: React.FC<CameraRecognizeViewProps> = ({
               <span className="text-base sm:text-lg font-semibold tracking-tight text-neutral-950 truncate leading-none">
                 {activeFace.matchedPerson.personName}
               </span>
-            ) : activeFace ? (
-              <span className="text-xs text-neutral-500 truncate leading-normal">
-                {activeFace.topCandidates[0]
-                  ? `最接近 ${activeFace.topCandidates[0].personName}（${activeFace.topCandidates[0].similarity}%）`
-                  : '暂无匹配档案'}
-              </span>
-            ) : (
+            ) : !activeFace ? (
               <span className="text-xs text-neutral-400 truncate leading-normal">
                 匹配后显示姓名
               </span>
-            )}
+            ) : null}
           </div>
         </div>
       </section>
-
-      {/* Inline Quick Save for Unmatched Face */}
-      {activeFace && !activeFace.matchedPerson && (
-        <form
-          onSubmit={handleQuickSave}
-          className="bg-white rounded-2xl border border-neutral-200/90 p-3.5 flex items-center gap-2.5"
-        >
-          <UserPlus className="w-4 h-4 text-neutral-400 shrink-0" />
-          <input
-            type="text"
-            value={registerName}
-            onChange={(e) => setRegisterName(e.target.value)}
-            placeholder="未在库中匹配，输入姓名可直接录入..."
-            className="flex-1 min-w-0 min-h-[38px] text-sm text-neutral-900 placeholder:text-neutral-400 bg-transparent focus:outline-none"
-          />
-          <button
-            type="submit"
-            disabled={registering || !registerName.trim()}
-            className="min-h-[38px] px-3.5 rounded-xl bg-neutral-900 text-white text-xs font-medium hover:bg-neutral-800 disabled:opacity-40 whitespace-nowrap shrink-0"
-          >
-            {registering ? '保存中' : '存入库'}
-          </button>
-        </form>
-      )}
     </div>
   );
 };

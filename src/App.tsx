@@ -384,36 +384,6 @@ export default function App() {
     [handleBatchImportSources]
   );
 
-  const handleQuickRegisterFace = useCallback(
-    async (
-      name: string,
-      note: string,
-      descriptor: number[],
-      thumbnail: string,
-      originalPhoto?: string
-    ): Promise<PersonRecord> => {
-      const current = await getAllPersons();
-      const sample: FaceSample = {
-        id: `sample-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-        descriptor,
-        thumbnail,
-        originalPhoto: originalPhoto || thumbnail,
-        sourceFilename: `${name.trim()}_实拍.jpg`,
-        detectionScore: 0.99,
-        createdAt: Date.now(),
-      };
-      const { updatedList, person } = await upsertPersonSample(
-        name,
-        sample,
-        note,
-        current
-      );
-      setPersons(updatedList);
-      return person;
-    },
-    [upsertPersonSample]
-  );
-
   const handleReorderPersons = useCallback(async (orderedIds: string[]) => {
     setPersons((prev) => {
       const byId = new Map(prev.map((p) => [p.id, p]));
@@ -672,7 +642,6 @@ export default function App() {
             persons={persons}
             engineState={engineState}
             minSimilarity={minSimilarity}
-            onQuickRegisterFace={handleQuickRegisterFace}
           />
         )}
 
