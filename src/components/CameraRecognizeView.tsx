@@ -256,7 +256,7 @@ export const CameraRecognizeView: React.FC<CameraRecognizeViewProps> = ({
               type="button"
               disabled={isBusy}
               onClick={() => void handleOpenSystemCamera()}
-              aria-label="调用系统相机拍照"
+              aria-label="调用相机拍照"
               className="w-[76px] h-[76px] rounded-full bg-[#141413] hover:bg-neutral-800 active:scale-95 text-white flex items-center justify-center transition-all disabled:opacity-45"
             >
               {isCapturing || isAnalyzing ? (
@@ -268,10 +268,10 @@ export const CameraRecognizeView: React.FC<CameraRecognizeViewProps> = ({
 
             <div className="space-y-1">
               <p className="text-sm font-medium text-neutral-900">
-                点击调用系统相机拍照
+                点击调用相机拍照
               </p>
               <p className="text-xs text-neutral-500">
-                支持原生光学变焦与长焦拍摄，拍完自动识别人物
+                支持原生光学变焦与长焦拍摄
               </p>
             </div>
           </div>

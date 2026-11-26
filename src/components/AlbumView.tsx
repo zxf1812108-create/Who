@@ -23,6 +23,10 @@ interface AlbumViewProps {
     personId: string,
     file: File
   ) => Promise<{ ok: boolean; message: string }>;
+  onReorderPersonSamples: (
+    personId: string,
+    orderedSampleIds: string[]
+  ) => Promise<void>;
   onDeleteSample: (personId: string, sampleId: string) => Promise<void>;
   onDeletePerson: (personId: string) => Promise<void>;
 }
@@ -35,6 +39,7 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
   onResetNameOrder,
   onUpdatePerson,
   onAddSampleToPerson,
+  onReorderPersonSamples,
   onDeleteSample,
   onDeletePerson,
 }) => {
@@ -94,12 +99,56 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
     return persons;
   }, [persons, query, isSearching, draftOrderIds]);
 
+  // Pointer-based drag-to-reorder state for multiple face samples inside modal
+  const [draggingSampleId, setDraggingSampleId] = useState<string | null>(null);
+  const [draftSampleOrderIds, setDraftSampleOrderIds] = useState<string[] | null>(
+    null
+  );
+
+  const sampleDragSessionRef = useRef<{
+    personId: string;
+    sampleId: string;
+    pointerId: number;
+    startX: number;
+    startY: number;
+    active: boolean;
+    didReorder: boolean;
+    longPressTimer: number | null;
+  } | null>(null);
+  const draftSampleOrderRef = useRef<string[] | null>(null);
+
   const selectedPerson = useMemo(
     () => persons.find((p) => p.id === selectedPersonId) || null,
     [persons, selectedPersonId]
   );
 
+  const selectedPersonRef = useRef(selectedPerson);
+  selectedPersonRef.current = selectedPerson;
+
+  const displayedSamples = useMemo(() => {
+    if (!selectedPerson) return [];
+    if (draftSampleOrderIds) {
+      const map = new Map(selectedPerson.samples.map((s) => [s.id, s]));
+      return draftSampleOrderIds
+        .map((id) => map.get(id))
+        .filter((s): s is PersonRecord['samples'][number] => Boolean(s));
+    }
+    return selectedPerson.samples;
+  }, [selectedPerson, draftSampleOrderIds]);
+
+  const cancelSampleDrag = () => {
+    const session = sampleDragSessionRef.current;
+    if (session?.longPressTimer !== null && session?.longPressTimer !== undefined) {
+      window.clearTimeout(session.longPressTimer);
+    }
+    sampleDragSessionRef.current = null;
+    draftSampleOrderRef.current = null;
+    setDraggingSampleId(null);
+    setDraftSampleOrderIds(null);
+  };
+
   const openPersonSheet = (person: PersonRecord) => {
+    cancelSampleDrag();
     setSelectedPersonId(person.id);
     setIsEditing(false);
     setEditName(person.name);
@@ -109,6 +158,7 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
   };
 
   const closePersonSheet = () => {
+    cancelSampleDrag();
     setSelectedPersonId(null);
     setIsEditing(false);
     setConfirmDeleteId(null);
@@ -262,6 +312,155 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
     }
   };
 
+  // Global pointer listeners for sample photo drag-to-reorder inside person sheet
+  useEffect(() => {
+    const activateSampleDrag = (sampleId: string) => {
+      const session = sampleDragSessionRef.current;
+      const person = selectedPersonRef.current;
+      if (!session || session.active || !person) return;
+      session.active = true;
+      const initialIds = person.samples.map((s) => s.id);
+      draftSampleOrderRef.current = initialIds;
+      setDraftSampleOrderIds(initialIds);
+      setDraggingSampleId(sampleId);
+    };
+
+    const handleSamplePointerMove = (e: PointerEvent) => {
+      const session = sampleDragSessionRef.current;
+      if (!session || session.pointerId !== e.pointerId) return;
+
+      const dx = e.clientX - session.startX;
+      const dy = e.clientY - session.startY;
+      const movedDist = Math.hypot(dx, dy);
+
+      if (!session.active) {
+        if (e.pointerType === 'mouse' && movedDist > 6) {
+          activateSampleDrag(session.sampleId);
+        } else if (e.pointerType !== 'mouse' && movedDist > 10) {
+          if (session.longPressTimer !== null) {
+            window.clearTimeout(session.longPressTimer);
+            session.longPressTimer = null;
+          }
+          sampleDragSessionRef.current = null;
+          return;
+        }
+      }
+
+      if (!session.active) return;
+
+      if (e.cancelable) {
+        e.preventDefault();
+      }
+
+      const targetEl = document
+        .elementFromPoint(e.clientX, e.clientY)
+        ?.closest<HTMLElement>('[data-sample-id]');
+      const overId = targetEl?.dataset.sampleId;
+
+      if (overId && overId !== session.sampleId && draftSampleOrderRef.current) {
+        const current = draftSampleOrderRef.current;
+        const fromIdx = current.indexOf(session.sampleId);
+        const toIdx = current.indexOf(overId);
+        if (fromIdx !== -1 && toIdx !== -1 && fromIdx !== toIdx) {
+          const next = [...current];
+          const [moved] = next.splice(fromIdx, 1);
+          next.splice(toIdx, 0, moved);
+          draftSampleOrderRef.current = next;
+          session.didReorder = true;
+          setDraftSampleOrderIds(next);
+        }
+      }
+    };
+
+    const finishSampleDrag = async (e: PointerEvent) => {
+      const session = sampleDragSessionRef.current;
+      if (!session || session.pointerId !== e.pointerId) return;
+
+      if (session.longPressTimer !== null) {
+        window.clearTimeout(session.longPressTimer);
+        session.longPressTimer = null;
+      }
+
+      const finalIds = draftSampleOrderRef.current;
+      const shouldPersist = session.active && session.didReorder && finalIds;
+      const targetPersonId = session.personId;
+
+      sampleDragSessionRef.current = null;
+      draftSampleOrderRef.current = null;
+      setDraggingSampleId(null);
+      setDraftSampleOrderIds(null);
+
+      if (shouldPersist) {
+        await onReorderPersonSamples(targetPersonId, finalIds);
+      }
+    };
+
+    const handleSampleTouchMove = (e: TouchEvent) => {
+      if (sampleDragSessionRef.current?.active && e.cancelable) {
+        e.preventDefault();
+      }
+    };
+
+    window.addEventListener('pointermove', handleSamplePointerMove, {
+      passive: false,
+    });
+    window.addEventListener('touchmove', handleSampleTouchMove, {
+      passive: false,
+    });
+    window.addEventListener('pointerup', finishSampleDrag);
+    window.addEventListener('pointercancel', finishSampleDrag);
+
+    return () => {
+      window.removeEventListener('pointermove', handleSamplePointerMove);
+      window.removeEventListener('touchmove', handleSampleTouchMove);
+      window.removeEventListener('pointerup', finishSampleDrag);
+      window.removeEventListener('pointercancel', finishSampleDrag);
+    };
+  }, [onReorderPersonSamples]);
+
+  const startSamplePointer = (
+    e: React.PointerEvent,
+    personId: string,
+    sampleId: string
+  ) => {
+    const person = selectedPersonRef.current;
+    if (!person || person.samples.length < 2) return;
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+
+    const session = {
+      personId,
+      sampleId,
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      active: false,
+      didReorder: false,
+      longPressTimer: null as number | null,
+    };
+    sampleDragSessionRef.current = session;
+
+    if (e.pointerType !== 'mouse') {
+      session.longPressTimer = window.setTimeout(() => {
+        const cur = sampleDragSessionRef.current;
+        const latestPerson = selectedPersonRef.current;
+        if (cur && cur.sampleId === sampleId && !cur.active && latestPerson) {
+          cur.active = true;
+          const initialIds = latestPerson.samples.map((s) => s.id);
+          draftSampleOrderRef.current = initialIds;
+          setDraftSampleOrderIds(initialIds);
+          setDraggingSampleId(sampleId);
+          if (typeof navigator !== 'undefined' && 'vibrate' in navigator) {
+            try {
+              navigator.vibrate(15);
+            } catch {
+              // Ignore vibration restrictions
+            }
+          }
+        }
+      }, 220);
+    }
+  };
+
   const handleSaveEdit = async (e?: React.FormEvent) => {
     e?.preventDefault();
     if (!selectedPerson) return;
@@ -272,7 +471,7 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
     }
     await onUpdatePerson(selectedPerson.id, trimmed, editNote.trim());
     setIsEditing(false);
-    setDetailNotice({ type: 'ok', text: '档案信息已保存' });
+    setDetailNotice(null);
   };
 
   const handleToggleEditOrSave = async () => {
@@ -296,10 +495,12 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
     setDetailNotice(null);
     const result = await onAddSampleToPerson(selectedPerson.id, file);
     setAddingSample(false);
-    setDetailNotice({
-      type: result.ok ? 'ok' : 'err',
-      text: result.message,
-    });
+    if (!result.ok) {
+      setDetailNotice({
+        type: 'err',
+        text: result.message,
+      });
+    }
   };
 
   return (
@@ -561,35 +762,43 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
                     <label className="block text-xs text-neutral-500 mb-1">
                       姓名
                     </label>
-                    <input
-                      ref={nameInputRef}
-                      type="text"
-                      value={editName}
-                      readOnly={!isEditing}
-                      onChange={(e) => setEditName(e.target.value)}
-                      className={`w-full min-h-[42px] px-3 rounded-xl border text-sm transition-colors focus:outline-none ${
-                        isEditing
-                          ? 'bg-white border-neutral-300 text-neutral-950 focus:border-neutral-900'
-                          : 'bg-[#F8F8F7] border-neutral-200/80 text-neutral-800'
-                      }`}
-                    />
+                    {isEditing ? (
+                      <input
+                        ref={nameInputRef}
+                        type="text"
+                        value={editName}
+                        onChange={(e) => setEditName(e.target.value)}
+                        className="w-full min-h-[42px] px-3 rounded-xl border bg-white border-neutral-300 text-sm text-neutral-950 focus:outline-none focus:border-neutral-900 transition-colors"
+                      />
+                    ) : (
+                      <div className="w-full min-h-[42px] px-3 rounded-xl border bg-[#F8F8F7] border-neutral-200/80 text-sm text-neutral-800 flex items-center select-none">
+                        <span className="truncate">{editName}</span>
+                      </div>
+                    )}
                   </div>
                   <div>
                     <label className="block text-xs text-neutral-500 mb-1">
                       备注（选填）
                     </label>
-                    <input
-                      type="text"
-                      value={editNote}
-                      readOnly={!isEditing}
-                      onChange={(e) => setEditNote(e.target.value)}
-                      placeholder={isEditing ? '分组或备注信息' : '暂无备注'}
-                      className={`w-full min-h-[42px] px-3 rounded-xl border text-sm transition-colors focus:outline-none ${
-                        isEditing
-                          ? 'bg-white border-neutral-300 text-neutral-950 focus:border-neutral-900'
-                          : 'bg-[#F8F8F7] border-neutral-200/80 text-neutral-800 placeholder:text-neutral-400'
-                      }`}
-                    />
+                    {isEditing ? (
+                      <input
+                        type="text"
+                        value={editNote}
+                        onChange={(e) => setEditNote(e.target.value)}
+                        placeholder="分组或备注信息"
+                        className="w-full min-h-[42px] px-3 rounded-xl border bg-white border-neutral-300 text-sm text-neutral-950 focus:outline-none focus:border-neutral-900 transition-colors"
+                      />
+                    ) : (
+                      <div className="w-full min-h-[42px] px-3 rounded-xl border bg-[#F8F8F7] border-neutral-200/80 text-sm flex items-center select-none">
+                        <span
+                          className={`truncate ${
+                            editNote ? 'text-neutral-800' : 'text-neutral-400'
+                          }`}
+                        >
+                          {editNote || '暂无备注'}
+                        </span>
+                      </div>
+                    )}
                   </div>
                 </div>
               </form>
@@ -601,7 +810,9 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
                       已录入的人脸照片
                     </div>
                     <div className="text-xs text-neutral-400">
-                      多角度可提升识别率
+                      {selectedPerson.samples.length > 1
+                        ? '多角度可提升识别率，按住照片可拖动排序'
+                        : '多角度可提升识别率'}
                     </div>
                   </div>
                   <button
@@ -626,34 +837,64 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
                   />
                 </div>
 
-                <div className="grid grid-cols-3 sm:grid-cols-4 gap-2.5">
-                  {selectedPerson.samples.map((sample) => (
-                    <div key={sample.id} className="space-y-1 relative">
-                      <div className="aspect-square rounded-xl overflow-hidden bg-[#F4F4F2] border border-neutral-200/80 relative">
-                        <img
-                          src={sample.thumbnail}
-                          alt={sample.sourceFilename}
-                          referrerPolicy="no-referrer"
-                          className="w-full h-full object-cover"
-                        />
-                        {selectedPerson.samples.length > 1 && (
-                          <button
-                            type="button"
-                            onClick={() =>
-                              void onDeleteSample(selectedPerson.id, sample.id)
-                            }
-                            aria-label="移除该照片样本"
-                            className="absolute top-1.5 right-1.5 w-6 h-6 rounded-full bg-black/65 text-white flex items-center justify-center hover:bg-red-600 transition-colors"
-                          >
-                            <X className="w-3 h-3" />
-                          </button>
-                        )}
+                <div
+                  className={`grid grid-cols-3 sm:grid-cols-4 gap-2.5 ${
+                    draggingSampleId ? 'select-none' : ''
+                  }`}
+                >
+                  {displayedSamples.map((sample) => {
+                    const isDraggingSample = draggingSampleId === sample.id;
+                    return (
+                      <div
+                        key={sample.id}
+                        data-sample-id={sample.id}
+                        onPointerDown={(e) =>
+                          startSamplePointer(e, selectedPerson.id, sample.id)
+                        }
+                        onContextMenu={(e) => e.preventDefault()}
+                        className={`space-y-1 relative select-none transition-transform duration-150 ${
+                          selectedPerson.samples.length > 1 ? 'cursor-grab' : ''
+                        } ${
+                          isDraggingSample
+                            ? 'touch-none scale-[1.04] opacity-80 z-10 cursor-grabbing'
+                            : ''
+                        }`}
+                      >
+                        <div
+                          className={`aspect-square rounded-xl overflow-hidden bg-[#F4F4F2] border relative ${
+                            isDraggingSample
+                              ? 'border-neutral-900 ring-2 ring-neutral-900/15 shadow-md'
+                              : 'border-neutral-200/80'
+                          }`}
+                        >
+                          <img
+                            src={sample.thumbnail}
+                            alt={sample.sourceFilename}
+                            draggable={false}
+                            referrerPolicy="no-referrer"
+                            className="w-full h-full object-cover select-none pointer-events-none"
+                          />
+                          {selectedPerson.samples.length > 1 && (
+                            <button
+                              type="button"
+                              onPointerDown={(e) => e.stopPropagation()}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void onDeleteSample(selectedPerson.id, sample.id);
+                              }}
+                              aria-label="移除该照片样本"
+                              className="absolute top-1.5 right-1.5 w-6 h-6 rounded-full bg-black/65 text-white flex items-center justify-center hover:bg-red-600 transition-colors"
+                            >
+                              <X className="w-3 h-3" />
+                            </button>
+                          )}
+                        </div>
+                        <p className="text-[11px] text-neutral-400 truncate font-mono">
+                          {sample.sourceFilename}
+                        </p>
                       </div>
-                      <p className="text-[11px] text-neutral-400 truncate font-mono">
-                        {sample.sourceFilename}
-                      </p>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             </div>

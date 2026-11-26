@@ -222,6 +222,7 @@ public class MainActivity extends BridgeActivity {
   const storagePluginSource = `package com.mianpushiren.app;
 
 import android.app.Activity;
+import android.content.ClipData;
 import android.content.ContentResolver;
 import android.content.Intent;
 import android.database.Cursor;
@@ -246,6 +247,8 @@ import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 
 @CapacitorPlugin(name = "StoragePicker")
@@ -256,6 +259,75 @@ public class StoragePickerPlugin extends Plugin {
     private String activeExportFilename = null;
     private long activeExportBytes = 0L;
     private String cachedRestoreContent = null;
+
+    @PluginMethod
+    public void pickMultipleImages(PluginCall call) {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("image/*");
+        intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        startActivityForResult(call, intent, "onPickMultipleImagesResult");
+    }
+
+    @ActivityCallback
+    private void onPickMultipleImagesResult(PluginCall call, ActivityResult result) {
+        if (call == null) return;
+        if (result.getResultCode() != Activity.RESULT_OK || result.getData() == null) {
+            JSObject ret = new JSObject();
+            ret.put("cancelled", true);
+            call.resolve(ret);
+            return;
+        }
+
+        Intent data = result.getData();
+        List<Uri> uris = new ArrayList<>();
+        ClipData clipData = data.getClipData();
+        if (clipData != null) {
+            for (int i = 0; i < clipData.getItemCount(); i++) {
+                Uri uri = clipData.getItemAt(i).getUri();
+                if (uri != null) uris.add(uri);
+            }
+        } else if (data.getData() != null) {
+            uris.add(data.getData());
+        }
+
+        if (uris.isEmpty()) {
+            JSObject ret = new JSObject();
+            ret.put("cancelled", true);
+            call.resolve(ret);
+            return;
+        }
+
+        new Thread(() -> {
+            try {
+                ContentResolver resolver = getContext().getContentResolver();
+                JSArray files = new JSArray();
+                for (Uri uri : uris) {
+                    String name = queryDisplayName(resolver, uri);
+                    String mime = resolver.getType(uri);
+                    if (name == null || name.trim().isEmpty()) {
+                        String seg = uri.getLastPathSegment();
+                        name = seg != null ? seg : "image.jpg";
+                    }
+                    if (isImageFile(name, mime)) {
+                        JSObject item = new JSObject();
+                        item.put("uri", uri.toString());
+                        item.put("name", name);
+                        item.put("mimeType", mime != null ? mime : "image/jpeg");
+                        files.put(item);
+                    }
+                }
+
+                JSObject ret = new JSObject();
+                ret.put("cancelled", false);
+                ret.put("files", files);
+                call.resolve(ret);
+            } catch (Exception ex) {
+                call.reject("读取所选照片失败: " + ex.getMessage());
+            }
+        }).start();
+    }
 
     @PluginMethod
     public void pickFolderImages(PluginCall call) {

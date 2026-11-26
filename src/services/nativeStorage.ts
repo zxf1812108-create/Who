@@ -7,6 +7,10 @@ export interface NativeDocumentImageRef {
 }
 
 interface StoragePickerPlugin {
+  pickMultipleImages(): Promise<{
+    cancelled: boolean;
+    files?: NativeDocumentImageRef[];
+  }>;
   pickFolderImages(): Promise<{
     cancelled: boolean;
     files?: NativeDocumentImageRef[];
@@ -166,6 +170,36 @@ export async function pickFolderImagesNativeOrWeb(
   }
 
   // 3. Fallback to HTML webkitdirectory input
+  fallbackClickInput();
+  return { handled: false, cancelled: false, items: [] };
+}
+
+/**
+ * Opens the native Android SAF document picker (ACTION_OPEN_DOCUMENT + EXTRA_ALLOW_MULTIPLE)
+ * so original filenames are preserved instead of being replaced with Android Photo Picker IDs.
+ */
+export async function pickMultipleImagesNativeOrWeb(
+  fallbackClickInput: () => void
+): Promise<{
+  handled: boolean;
+  cancelled: boolean;
+  items: ImportableImageSource[];
+}> {
+  if (Capacitor.isNativePlatform()) {
+    const res = await StoragePicker.pickMultipleImages();
+    if (res.cancelled) {
+      return { handled: true, cancelled: true, items: [] };
+    }
+    const items: ImportableImageSource[] = (res.files || []).map((f) => ({
+      name: f.name,
+      loadDataUrl: async () => {
+        const read = await StoragePicker.readDocumentImage({ uri: f.uri });
+        return read.dataUrl;
+      },
+    }));
+    return { handled: true, cancelled: false, items };
+  }
+
   fallbackClickInput();
   return { handled: false, cancelled: false, items: [] };
 }

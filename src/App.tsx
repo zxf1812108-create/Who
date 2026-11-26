@@ -526,6 +526,39 @@ export default function App() {
     [persons]
   );
 
+  const handleReorderPersonSamples = useCallback(
+    async (personId: string, orderedSampleIds: string[]) => {
+      setPersons((prev) =>
+        prev.map((person) => {
+          if (person.id !== personId) return person;
+          const byId = new Map(person.samples.map((s) => [s.id, s]));
+          const reordered: FaceSample[] = [];
+
+          for (const sampleId of orderedSampleIds) {
+            const item = byId.get(sampleId);
+            if (item) {
+              reordered.push(item);
+              byId.delete(sampleId);
+            }
+          }
+
+          for (const leftover of byId.values()) {
+            reordered.push(leftover);
+          }
+
+          const updated: PersonRecord = {
+            ...person,
+            samples: reordered,
+            updatedAt: Date.now(),
+          };
+          void putPerson(updated);
+          return updated;
+        })
+      );
+    },
+    []
+  );
+
   const handleDeletePerson = useCallback(async (personId: string) => {
     await deletePersonById(personId);
     setPersons((prev) => prev.filter((p) => p.id !== personId));
@@ -652,6 +685,7 @@ export default function App() {
             onResetNameOrder={handleResetNameOrder}
             onUpdatePerson={handleUpdatePerson}
             onAddSampleToPerson={handleAddSampleToPerson}
+            onReorderPersonSamples={handleReorderPersonSamples}
             onDeleteSample={handleDeleteSample}
             onDeletePerson={handleDeletePerson}
           />

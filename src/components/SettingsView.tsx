@@ -15,6 +15,7 @@ import type { ImportableImageSource } from '../services/nativeStorage';
 import {
   pickBackupFileNativeOrWeb,
   pickFolderImagesNativeOrWeb,
+  pickMultipleImagesNativeOrWeb,
 } from '../services/nativeStorage';
 
 interface SettingsViewProps {
@@ -36,8 +37,6 @@ interface SettingsViewProps {
 
 export const SettingsView: React.FC<SettingsViewProps> = ({
   engineState,
-  personCount,
-  totalSampleCount,
   queue,
   isImporting,
   mergeIndexedSuffixes,
@@ -93,6 +92,26 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     e.target.value = '';
     if (selected.length > 0) {
       void onImportFiles(selected);
+    }
+  };
+
+  const handleFilesButtonClick = async () => {
+    if (isDisabled) return;
+    try {
+      const result = await pickMultipleImagesNativeOrWeb(() => {
+        fileInputRef.current?.click();
+      });
+      if (!result.handled || result.cancelled) return;
+      if (result.items.length === 0) {
+        showNotice('err', '未选择可导入的图片文件');
+        return;
+      }
+      await onImportSources(result.items);
+    } catch (err) {
+      showNotice(
+        'err',
+        err instanceof Error ? err.message : '选择照片失败，请重试'
+      );
     }
   };
 
@@ -195,32 +214,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         aria-label="导入照片"
         className="bg-white rounded-2xl border border-neutral-200/90 p-5 space-y-4"
       >
-        <div className="flex items-baseline justify-between gap-3">
-          <div>
-            <h1 className="text-base font-semibold text-neutral-950">
-              导入照片
-            </h1>
-            <p className="text-xs text-neutral-500 mt-0.5">
-              以照片文件名作为人物姓名，自动提取面部特征
-            </p>
-          </div>
-          <span className="text-xs text-neutral-400 tabular-nums shrink-0">
-            库内 {personCount} 人 · {totalSampleCount} 张
-          </span>
+        <div>
+          <h1 className="text-base font-semibold text-neutral-950">
+            导入照片
+          </h1>
+          <p className="text-xs text-neutral-500 mt-0.5">
+            以照片文件名作为人物姓名，自动提取面部特征
+          </p>
         </div>
 
         {/* Primary Import Buttons */}
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-          <button
-            type="button"
-            disabled={isDisabled}
-            onClick={() => fileInputRef.current?.click()}
-            className="min-h-[48px] px-4 py-3 rounded-xl bg-neutral-950 text-white text-sm font-medium hover:bg-neutral-800 active:scale-[0.98] transition-all flex items-center justify-center gap-2 disabled:opacity-45"
-          >
-            <ImagePlus className="w-4 h-4" strokeWidth={1.8} />
-            <span>批量导入照片</span>
-          </button>
-
           <button
             type="button"
             disabled={isDisabled}
@@ -229,6 +233,16 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           >
             <FolderOpen className="w-4 h-4" strokeWidth={1.8} />
             <span>导入整个文件夹</span>
+          </button>
+
+          <button
+            type="button"
+            disabled={isDisabled}
+            onClick={() => void handleFilesButtonClick()}
+            className="min-h-[48px] px-4 py-3 rounded-xl bg-[#F4F4F2] text-neutral-900 text-sm font-medium hover:bg-neutral-200/75 active:scale-[0.98] transition-all flex items-center justify-center gap-2 disabled:opacity-45"
+          >
+            <ImagePlus className="w-4 h-4" strokeWidth={1.8} />
+            <span>批量导入照片</span>
           </button>
         </div>
 
@@ -258,10 +272,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             className="mt-0.5 h-4 w-4 rounded border-neutral-300 accent-neutral-900"
           />
           <span className="text-xs text-neutral-600 leading-relaxed">
-            自动合并同名序号照片（如{' '}
-            <span className="font-mono text-neutral-800">张三_1.jpg</span> 与{' '}
-            <span className="font-mono text-neutral-800">张三_2.jpg</span>{' '}
-            归为同一人）
+            <span className="block">自动合并同名序号照片</span>
+            <span className="block">
+              （如{' '}
+              <span className="font-mono text-neutral-800">张三_1.jpg</span> 与{' '}
+              <span className="font-mono text-neutral-800">张三_2.jpg</span>{' '}
+              归为同一人）
+            </span>
           </span>
         </label>
 
@@ -410,7 +427,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       >
         <div className="space-y-1.5">
           <h2 className="text-base font-semibold text-neutral-950">
-            匹配相似度
+            设置最低匹配相似度
           </h2>
           <p className="text-xs text-neutral-500 leading-relaxed">
             数值越小，匹配越宽松，越容易认出，但也容易认错；数值越大，匹配越严格，越不容易认出，但也不容易认错。
