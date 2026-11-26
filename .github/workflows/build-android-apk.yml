@@ -159,15 +159,30 @@ jobs:
 
             "$BUILD_TOOLS_DIR/zipalign" -f -p 4 "$UNSIGNED_APK" /tmp/renlian-aligned.apk
 
+            OUT_APK="release/renlian-v${ANDROID_VERSION_NAME}-release.apk"
             KEYSTORE_FILE="/tmp/release-signing.jks"
             if [ -n "$KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ]; then
               echo "Using configured GitHub Secrets release keystore."
-              printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_FILE"
+              printf '%s' "$KEYSTORE_BASE64" | tr -d '\r\n\t ' | base64 --decode > "$KEYSTORE_FILE"
               STORE_PASS="$KEYSTORE_PASSWORD"
               ALIAS_NAME="$KEY_ALIAS"
               ALIAS_PASS="${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
+              "$BUILD_TOOLS_DIR/apksigner" sign \
+                --ks "$KEYSTORE_FILE" \
+                --ks-key-alias "$ALIAS_NAME" \
+                --ks-pass "pass:$STORE_PASS" \
+                --key-pass "pass:$ALIAS_PASS" \
+                --out "$OUT_APK" \
+                /tmp/renlian-aligned.apk
+            elif [ -f "signing/renlian.pk8" ] && [ -f "signing/renlian.x509.pem" ]; then
+              echo "Using fixed repository release signing key (signing/renlian.pk8)."
+              "$BUILD_TOOLS_DIR/apksigner" sign \
+                --key "signing/renlian.pk8" \
+                --cert "signing/renlian.x509.pem" \
+                --out "$OUT_APK" \
+                /tmp/renlian-aligned.apk
             else
-              echo "No custom keystore secrets detected; generating temporary signing key for installable Release APK."
+              echo "No release signing key found; generating temporary signing key."
               STORE_PASS="$(openssl rand -hex 16)"
               ALIAS_PASS="$STORE_PASS"
               ALIAS_NAME="renlian"
@@ -178,16 +193,14 @@ jobs:
                 -storepass "$STORE_PASS" \
                 -keypass "$ALIAS_PASS" \
                 -dname "CN=RenLian, OU=Mobile, O=RenLian, L=Shanghai, S=Shanghai, C=CN"
+              "$BUILD_TOOLS_DIR/apksigner" sign \
+                --ks "$KEYSTORE_FILE" \
+                --ks-key-alias "$ALIAS_NAME" \
+                --ks-pass "pass:$STORE_PASS" \
+                --key-pass "pass:$ALIAS_PASS" \
+                --out "$OUT_APK" \
+                /tmp/renlian-aligned.apk
             fi
-
-            OUT_APK="release/renlian-v${ANDROID_VERSION_NAME}-release.apk"
-            "$BUILD_TOOLS_DIR/apksigner" sign \
-              --ks "$KEYSTORE_FILE" \
-              --ks-key-alias "$ALIAS_NAME" \
-              --ks-pass "pass:$STORE_PASS" \
-              --key-pass "pass:$ALIAS_PASS" \
-              --out "$OUT_APK" \
-              /tmp/renlian-aligned.apk
 
             "$BUILD_TOOLS_DIR/apksigner" verify "$OUT_APK"
             rm -f "$KEYSTORE_FILE" /tmp/renlian-aligned.apk
