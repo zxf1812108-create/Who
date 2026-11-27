@@ -720,7 +720,7 @@ export const AlbumView: React.FC<AlbumViewProps> = ({
               {confirmDeleteId === selectedPerson.id && (
                 <div className="flex items-center justify-between gap-3 bg-red-50 border border-red-200 rounded-xl px-3.5 py-2.5">
                   <span className="text-xs text-red-800">
-                    确定删除「{selectedPerson.name}」及全部照片？
+                    确定删除此人及全部照片？
                   </span>
                   <div className="flex items-center gap-2 shrink-0">
                     <button
